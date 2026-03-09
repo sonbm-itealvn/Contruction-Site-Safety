@@ -48,6 +48,10 @@ python run.py
 2. Trong `src/config/settings.py` đặt `MODEL_PATH = r"đường_dẫn\tới\model.pt"`.
 3. Trong `src/services/detector.py` chỉnh `CLASS_NAMES` và `CLASS_TO_VIOLATION` cho đúng nhãn dataset của bạn (ví dụ: 0=with_helmet, 1=without_helmet, 2=with_vest, 3=without_vest).
 
+## Train model trên Google Colab
+
+Để train YOLO (và chạy Data Augmentation) trên Colab (GPU miễn phí): mở notebook `notebooks/train_on_colab.ipynb` trong [Google Colab](https://colab.research.google.com/) (Upload notebook hoặc mở từ GitHub). Chi tiết từng bước: [docs/COLAB.md](docs/COLAB.md).
+
 ## Cấu hình
 
 - `src/config/settings.py`: `CAMERA_INDEX` (0 = webcam), `CAMERA_AREA_NAME`, `CONFIDENCE_THRESHOLD`, `MODEL_PATH`.
