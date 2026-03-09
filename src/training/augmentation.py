@@ -328,8 +328,8 @@ class RandomPerspective(BaseAugment):
     def apply(self, image: np.ndarray, boxes: np.ndarray, has_class: bool) -> Tuple[np.ndarray, np.ndarray]:
         h, w = image.shape[:2]
         d = self.distort_scale * min(w, h)
-        src = np.float32([[0, 0], [w, 0], [w, h], [0, h]])
-        dst = src + np.random.uniform(-d, d, (4, 2))
+        src = np.array([[0, 0], [w, 0], [w, h], [0, h]], dtype=np.float32)
+        dst = np.array(src + np.random.uniform(-d, d, (4, 2)), dtype=np.float32)
         M = cv2.getPerspectiveTransform(src, dst)
         out = cv2.warpPerspective(image, M, (w, h), borderMode=cv2.BORDER_REPLICATE)
         xyxy = _xywh_to_xyxy(boxes, has_class)
