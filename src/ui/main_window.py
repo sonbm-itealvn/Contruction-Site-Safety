@@ -16,37 +16,55 @@ from src.models import Violation, ViolationType, DetectionResult
 from src.services.camera_thread import CameraThread
 from src.ui.settings_dialog import SettingsDialog
 
-# Giao diện sáng + font hỗ trợ tiếng Việt
+# Giao diện sáng, tông nhẹ nhàng và hơi trong (pastel)
 ctk.set_appearance_mode("light")
 ctk.set_default_color_theme("blue")
 import sys
 _FONT_FAMILY = "Segoe UI" if sys.platform == "win32" else "DejaVu Sans"
 
+_COLORS = {
+    "bg_app": "#F8FAFC",
+    "card_bg": "#FFFFFF",
+    "total_bg": "#FFEBEE",
+    "total_accent": "#EB5757",
+    "helmet_bg": "#FFF8F3",
+    "helmet_accent": "#E67E22",
+    "vest_bg": "#FFFBF3",
+    "vest_accent": "#D4A017",
+    "both_bg": "#FFF3F3",
+    "both_accent": "#C0392B",
+    "alert_bg": "#FEE8E8",
+    "alert_border": "#EB5757",
+    "text_primary": "#1E293B",
+    "text_secondary": "#64748B",
+}
+
 
 class KPICard(ctk.CTkFrame):
-    """Một thẻ thống kê (Tổng vi phạm, Thiếu mũ, ...)."""
+    """Thẻ KPI: nền pastel nhẹ, icon + số màu accent."""
 
     def __init__(
         self,
         master,
         title: str,
         value: int = 0,
-        color: str = "#e74c3c",
+        bg_color: str = "#FFEBEE",
+        accent_color: str = "#EB5757",
         icon_text: str = "⚠",
         **kwargs,
     ):
-        super().__init__(master, fg_color=color, corner_radius=12, **kwargs)
+        super().__init__(master, fg_color=bg_color, corner_radius=12, **kwargs)
         self._value_var = ctk.StringVar(value=str(value))
         inner = ctk.CTkFrame(self, fg_color="transparent")
         inner.pack(fill="both", expand=True, padx=16, pady=12)
         ctk.CTkLabel(
-            inner, text=icon_text, font=ctk.CTkFont(_FONT_FAMILY, size=28), text_color="white",
+            inner, text=icon_text, font=ctk.CTkFont(_FONT_FAMILY, size=26), text_color=accent_color,
         ).pack(anchor="w")
         ctk.CTkLabel(
-            inner, textvariable=self._value_var, font=ctk.CTkFont(_FONT_FAMILY, size=28, weight="bold"), text_color="white",
+            inner, textvariable=self._value_var, font=ctk.CTkFont(_FONT_FAMILY, size=26, weight="bold"), text_color=accent_color,
         ).pack(anchor="w")
         ctk.CTkLabel(
-            inner, text=title, font=ctk.CTkFont(_FONT_FAMILY, size=13), text_color="white",
+            inner, text=title, font=ctk.CTkFont(_FONT_FAMILY, size=13), text_color=_COLORS["text_secondary"],
         ).pack(anchor="w")
 
     def set_value(self, value: int):
@@ -54,27 +72,27 @@ class KPICard(ctk.CTkFrame):
 
 
 class ViolationCard(ctk.CTkFrame):
-    """Một dòng trong danh sách vi phạm."""
+    """Thẻ vi phạm: nền pastel nhẹ, viền mỏng."""
 
     def __init__(self, master, violation: Violation, **kwargs):
         if violation.violation_type == ViolationType.MISSING_BOTH:
-            color = "#c0392b"
+            bg_color, accent = _COLORS["both_bg"], _COLORS["both_accent"]
         elif violation.violation_type == ViolationType.MISSING_HELMET:
-            color = "#f39c12"
+            bg_color, accent = _COLORS["helmet_bg"], _COLORS["helmet_accent"]
         else:
-            color = "#f1c40f"
-        super().__init__(master, fg_color=color, corner_radius=8, **kwargs)
+            bg_color, accent = _COLORS["vest_bg"], _COLORS["vest_accent"]
+        super().__init__(master, fg_color=bg_color, corner_radius=10, border_width=1, border_color="#E2E8F0", **kwargs)
         inner = ctk.CTkFrame(self, fg_color="transparent")
-        inner.pack(fill="both", expand=True, padx=12, pady=8)
+        inner.pack(fill="both", expand=True, padx=12, pady=10)
         icon = "⛑🦺" if violation.violation_type == ViolationType.MISSING_BOTH else ("⛑" if violation.violation_type == ViolationType.MISSING_HELMET else "🦺")
-        ctk.CTkLabel(inner, text=icon, font=ctk.CTkFont(_FONT_FAMILY, size=20)).pack(side="left", padx=(0, 10))
+        ctk.CTkLabel(inner, text=icon, font=ctk.CTkFont(_FONT_FAMILY, size=20), text_color=accent).pack(side="left", padx=(0, 10))
         right = ctk.CTkFrame(inner, fg_color="transparent")
         right.pack(side="left", fill="both", expand=True)
         ctk.CTkLabel(
-            right, text=violation.label_vi, font=ctk.CTkFont(_FONT_FAMILY, size=14, weight="bold"), anchor="w",
+            right, text=violation.label_vi, font=ctk.CTkFont(_FONT_FAMILY, size=14, weight="bold"), text_color=_COLORS["text_primary"], anchor="w",
         ).pack(anchor="w")
         ctk.CTkLabel(
-            right, text=f"{violation.time_str} · Độ chính xác: {violation.confidence_pct}", font=ctk.CTkFont(_FONT_FAMILY, size=12), anchor="w",
+            right, text=f"🕐 {violation.time_str} · Độ chính xác: {violation.confidence_pct}", font=ctk.CTkFont(_FONT_FAMILY, size=12), text_color=_COLORS["text_secondary"], anchor="w",
         ).pack(anchor="w")
 
 
@@ -86,6 +104,7 @@ class MainWindow:
         self.root.title("Hệ thống giám sát an toàn lao động")
         self.root.geometry("1280x780")
         self.root.minsize(1024, 600)
+        self.root.configure(fg_color="#F8FAFC")
 
         # Lưu vi phạm để hiển thị (giới hạn 100)
         self._violations: Deque[Violation] = deque(maxlen=100)
@@ -107,11 +126,11 @@ class MainWindow:
         left.pack(side="left", fill="y")
         ctk.CTkLabel(
             left, text="Hệ thống giám sát an toàn lao động",
-            font=ctk.CTkFont(_FONT_FAMILY, size=22, weight="bold"),
+            font=ctk.CTkFont(_FONT_FAMILY, size=22, weight="bold"), text_color=_COLORS["text_primary"],
         ).pack(anchor="w")
         ctk.CTkLabel(
             left, text="Nhận diện vi phạm trang bị bảo hộ real-time",
-            font=ctk.CTkFont(_FONT_FAMILY, size=13), text_color="gray",
+            font=ctk.CTkFont(_FONT_FAMILY, size=13), text_color=_COLORS["text_secondary"],
         ).pack(anchor="w")
         ctk.CTkButton(
             header, text="Cài đặt", width=100, font=ctk.CTkFont(_FONT_FAMILY), command=self._on_settings,
@@ -120,23 +139,28 @@ class MainWindow:
         # ---- KPI cards ----
         kpi_frame = ctk.CTkFrame(self.root, fg_color="transparent")
         kpi_frame.pack(fill="x", padx=24, pady=(0, 12))
-        self._kpi_total = KPICard(kpi_frame, "Tổng vi phạm", 0, color="#e74c3c", icon_text="⚠")
+        self._kpi_total = KPICard(kpi_frame, "Tổng vi phạm", 0, bg_color=_COLORS["total_bg"], accent_color=_COLORS["total_accent"], icon_text="⚠")
         self._kpi_total.pack(side="left", fill="x", expand=True, padx=4)
-        self._kpi_helmet = KPICard(kpi_frame, "Thiếu mũ bảo hộ", 0, color="#e67e22", icon_text="⛑")
+        self._kpi_helmet = KPICard(kpi_frame, "Thiếu mũ bảo hộ", 0, bg_color=_COLORS["helmet_bg"], accent_color=_COLORS["helmet_accent"], icon_text="⛑")
         self._kpi_helmet.pack(side="left", fill="x", expand=True, padx=4)
-        self._kpi_vest = KPICard(kpi_frame, "Thiếu áo bảo hộ", 0, color="#f1c40f", icon_text="🦺")
+        self._kpi_vest = KPICard(kpi_frame, "Thiếu áo bảo hộ", 0, bg_color=_COLORS["vest_bg"], accent_color=_COLORS["vest_accent"], icon_text="🦺")
         self._kpi_vest.pack(side="left", fill="x", expand=True, padx=4)
-        self._kpi_both = KPICard(kpi_frame, "Thiếu cả hai", 0, color="#c0392b", icon_text="⛑🦺")
+        self._kpi_both = KPICard(kpi_frame, "Thiếu cả hai", 0, bg_color=_COLORS["both_bg"], accent_color=_COLORS["both_accent"], icon_text="⛑🦺")
         self._kpi_both.pack(side="left", fill="x", expand=True, padx=4)
 
-        # ---- Alert bar ----
-        self._alert_bar = ctk.CTkFrame(self.root, fg_color="#e74c3c", corner_radius=8, height=44)
+        # ---- Alert bar: nền hồng nhạt, viền trái đỏ ----
+        self._alert_bar = ctk.CTkFrame(self.root, fg_color=_COLORS["alert_bg"], corner_radius=8, height=48, border_width=0)
         self._alert_bar.pack(fill="x", padx=24, pady=(0, 16))
+        # Viền trái đỏ (frame mỏng)
+        alert_left_border = ctk.CTkFrame(self._alert_bar, fg_color=_COLORS["alert_border"], width=4, corner_radius=2)
+        alert_left_border.place(relx=0, rely=0, relheight=1, anchor="nw")
+        inner_alert = ctk.CTkFrame(self._alert_bar, fg_color="transparent")
+        inner_alert.place(relx=0.5, rely=0.5, anchor="center")
         self._alert_label = ctk.CTkLabel(
-            self._alert_bar, text="Không có vi phạm.",
-            font=ctk.CTkFont(_FONT_FAMILY, size=13), text_color="white",
+            inner_alert, text="Không có vi phạm.",
+            font=ctk.CTkFont(_FONT_FAMILY, size=13), text_color=_COLORS["alert_border"],
         )
-        self._alert_label.place(relx=0.5, rely=0.5, anchor="center")
+        self._alert_label.pack()
         self._alert_bar.pack_forget()  # Ẩn khi không có vi phạm
 
         self._alert_bar_placeholder = ctk.CTkFrame(self.root, fg_color="transparent", height=8)
@@ -153,7 +177,7 @@ class MainWindow:
         cam_title.pack(fill="x", pady=(0, 8))
         self._camera_title_label = ctk.CTkLabel(
             cam_title, text=f"Camera công trường - {CAMERA_AREA_NAME}",
-            font=ctk.CTkFont(_FONT_FAMILY, size=15, weight="bold"),
+            font=ctk.CTkFont(_FONT_FAMILY, size=15, weight="bold"), text_color=_COLORS["text_primary"],
         )
         self._camera_title_label.pack(side="left")
         ctk.CTkButton(
@@ -166,7 +190,7 @@ class MainWindow:
         )
         self._btn_back_camera.pack(side="right")
         self._btn_back_camera.pack_forget()  # Chỉ hiện khi đang phát video
-        self._video_container = ctk.CTkFrame(left_pane, fg_color="#2b2b2b", corner_radius=8)
+        self._video_container = ctk.CTkFrame(left_pane, fg_color="#1E293B", corner_radius=10)
         self._video_container.pack(fill="both", expand=True)
         self._video_label = ctk.CTkLabel(
             self._video_container, text="Đang kết nối camera...",
@@ -184,20 +208,23 @@ class MainWindow:
         )
         self._rec_badge.place(relx=0.98, rely=0.03, anchor="ne")
 
-        # Right: Violation list
+        # Right: Violation list - header nền trắng, bo góc
         right_pane = ctk.CTkFrame(content, fg_color="transparent", width=320)
         right_pane.pack(side="right", fill="y", padx=(12, 0))
         right_pane.pack_propagate(False)
-        list_header = ctk.CTkFrame(right_pane, fg_color="transparent")
+        list_header = ctk.CTkFrame(right_pane, fg_color="white", corner_radius=10, border_width=1, border_color="#E2E8F0")
         list_header.pack(fill="x", pady=(0, 8))
-        ctk.CTkLabel(list_header, text="Danh sách vi phạm", font=ctk.CTkFont(_FONT_FAMILY, size=15, weight="bold")).pack(side="left")
+        inner_header = ctk.CTkFrame(list_header, fg_color="transparent")
+        inner_header.pack(fill="x", padx=14, pady=10)
+        ctk.CTkLabel(inner_header, text="⚠", font=ctk.CTkFont(_FONT_FAMILY, size=18), text_color=_COLORS["total_accent"]).pack(side="left", padx=(0, 6))
+        ctk.CTkLabel(inner_header, text="Danh sách vi phạm", font=ctk.CTkFont(_FONT_FAMILY, size=15, weight="bold"), text_color=_COLORS["text_primary"]).pack(side="left")
         self._violation_count_badge = ctk.CTkLabel(
-            list_header, text=" 0 ", font=ctk.CTkFont(_FONT_FAMILY, size=12),
-            fg_color="#e74c3c", text_color="white", corner_radius=10,
+            inner_header, text=" 0 ", font=ctk.CTkFont(_FONT_FAMILY, size=12),
+            fg_color=_COLORS["total_accent"], text_color="white", corner_radius=10,
         )
         self._violation_count_badge.pack(side="left", padx=8)
         ctk.CTkButton(
-            list_header, text="Xóa tất cả", fg_color="transparent", text_color="gray", width=80,
+            inner_header, text="Xóa tất cả", fg_color="transparent", text_color=_COLORS["text_secondary"], width=80,
             font=ctk.CTkFont(_FONT_FAMILY), command=self._clear_violations,
         ).pack(side="right")
         self._violation_scroll = ctk.CTkScrollableFrame(right_pane, fg_color="transparent")

@@ -10,7 +10,7 @@ from typing import List, Optional, Tuple, Any
 import cv2
 import numpy as np
 
-from src.config.settings import CONFIDENCE_THRESHOLD, MODEL_PATH, YOLO26_MODEL
+from src.config.settings import CONFIDENCE_THRESHOLD, DETECT_IMGSZ, MODEL_PATH, YOLO26_MODEL
 from src.models import Violation, ViolationType
 
 
@@ -90,7 +90,9 @@ class PPEDetector:
         return draw_violations_on_frame(frame, violations), violations, []
 
     def _detect_yolo_and_draw_all(self, frame: np.ndarray) -> Tuple[np.ndarray, List[Violation], List[dict]]:
-        results = self._model.predict(frame, conf=self.conf_threshold, verbose=False, stream=False)
+        results = self._model.predict(
+            frame, conf=self.conf_threshold, verbose=False, stream=False, imgsz=DETECT_IMGSZ
+        )
         violations = []
         tracked_boxes: List[dict] = []
         out = frame.copy()
@@ -132,7 +134,9 @@ class PPEDetector:
         return out, violations, tracked_boxes
 
     def _detect_yolo(self, frame: np.ndarray) -> List[Violation]:
-        results = self._model.predict(frame, conf=self.conf_threshold, verbose=False, stream=False)
+        results = self._model.predict(
+            frame, conf=self.conf_threshold, verbose=False, stream=False, imgsz=DETECT_IMGSZ
+        )
         violations = []
         for r in results:
             if r.boxes is None:

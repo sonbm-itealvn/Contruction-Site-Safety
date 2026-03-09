@@ -25,8 +25,12 @@ CONFIDENCE_THRESHOLD = 0.25
 VIOLATION_THROTTLE_SECONDS = 0.8
 MODEL_PATH = os.path.join(PROJECT_ROOT, "helmet_best.pt")
 YOLO26_MODEL = "yolo26n.pt"
-# Chạy detection mỗi N frame; giữa các lần chỉ vẽ lại box cũ (không dùng tracker để tránh lag)
+# Chạy detection mỗi N frame (dùng chung cho cả camera và video); giữa các lần track Person hoặc vẽ lại box.
 DETECT_EVERY_N_FRAMES = 5
+# Kích thước ảnh đưa vào YOLO — dùng cho cả camera và video (nhỏ = nhanh hơn).
+DETECT_IMGSZ = 416
+# Chỉ track box "Person" giữa các lần detect (cả camera và video), ít tracker = ít lag.
+TRACK_PERSON_ONLY = True
 
 # Ghi hình
 RECORDING_ENABLED = False
