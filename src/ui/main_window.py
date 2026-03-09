@@ -11,13 +11,16 @@ import customtkinter as ctk
 from PIL import Image
 import numpy as np
 
-from src.config.settings import CAMERA_AREA_NAME
+from src.config.settings import CAMERA_AREA_NAME, CAMERA_INDEX, VIOLATION_THROTTLE_SECONDS
 from src.models import Violation, ViolationType, DetectionResult
 from src.services.camera_thread import CameraThread
+from src.ui.settings_dialog import SettingsDialog
 
-# Giao diện sáng
+# Giao diện sáng + font hỗ trợ tiếng Việt
 ctk.set_appearance_mode("light")
 ctk.set_default_color_theme("blue")
+import sys
+_FONT_FAMILY = "Segoe UI" if sys.platform == "win32" else "DejaVu Sans"
 
 
 class KPICard(ctk.CTkFrame):
@@ -37,13 +40,13 @@ class KPICard(ctk.CTkFrame):
         inner = ctk.CTkFrame(self, fg_color="transparent")
         inner.pack(fill="both", expand=True, padx=16, pady=12)
         ctk.CTkLabel(
-            inner, text=icon_text, font=ctk.CTkFont(size=28), text_color="white",
+            inner, text=icon_text, font=ctk.CTkFont(_FONT_FAMILY, size=28), text_color="white",
         ).pack(anchor="w")
         ctk.CTkLabel(
-            inner, textvariable=self._value_var, font=ctk.CTkFont(size=28, weight="bold"), text_color="white",
+            inner, textvariable=self._value_var, font=ctk.CTkFont(_FONT_FAMILY, size=28, weight="bold"), text_color="white",
         ).pack(anchor="w")
         ctk.CTkLabel(
-            inner, text=title, font=ctk.CTkFont(size=13), text_color="white",
+            inner, text=title, font=ctk.CTkFont(_FONT_FAMILY, size=13), text_color="white",
         ).pack(anchor="w")
 
     def set_value(self, value: int):
@@ -64,14 +67,14 @@ class ViolationCard(ctk.CTkFrame):
         inner = ctk.CTkFrame(self, fg_color="transparent")
         inner.pack(fill="both", expand=True, padx=12, pady=8)
         icon = "⛑🦺" if violation.violation_type == ViolationType.MISSING_BOTH else ("⛑" if violation.violation_type == ViolationType.MISSING_HELMET else "🦺")
-        ctk.CTkLabel(inner, text=icon, font=ctk.CTkFont(size=20)).pack(side="left", padx=(0, 10))
+        ctk.CTkLabel(inner, text=icon, font=ctk.CTkFont(_FONT_FAMILY, size=20)).pack(side="left", padx=(0, 10))
         right = ctk.CTkFrame(inner, fg_color="transparent")
         right.pack(side="left", fill="both", expand=True)
         ctk.CTkLabel(
-            right, text=violation.label_vi, font=ctk.CTkFont(size=14, weight="bold"), anchor="w",
+            right, text=violation.label_vi, font=ctk.CTkFont(_FONT_FAMILY, size=14, weight="bold"), anchor="w",
         ).pack(anchor="w")
         ctk.CTkLabel(
-            right, text=f"{violation.time_str} · Độ chính xác: {violation.confidence_pct}", font=ctk.CTkFont(size=12), anchor="w",
+            right, text=f"{violation.time_str} · Độ chính xác: {violation.confidence_pct}", font=ctk.CTkFont(_FONT_FAMILY, size=12), anchor="w",
         ).pack(anchor="w")
 
 
@@ -90,9 +93,11 @@ class MainWindow:
         self._video_image: ctk.CTkImage | None = None  # Giữ reference để cập nhật
         self._video_label: ctk.CTkLabel | None = None
         self._last_violation_time: dict = {}  # throttle: type -> last add time
+        # Nguồn hiện tại: int = camera index, str = đường dẫn file video
+        self._current_source: int | str = CAMERA_INDEX
 
         self._setup_ui()
-        self._start_camera()
+        self._start_source()
 
     def _setup_ui(self):
         # ---- Header ----
@@ -102,14 +107,14 @@ class MainWindow:
         left.pack(side="left", fill="y")
         ctk.CTkLabel(
             left, text="Hệ thống giám sát an toàn lao động",
-            font=ctk.CTkFont(size=22, weight="bold"),
+            font=ctk.CTkFont(_FONT_FAMILY, size=22, weight="bold"),
         ).pack(anchor="w")
         ctk.CTkLabel(
             left, text="Nhận diện vi phạm trang bị bảo hộ real-time",
-            font=ctk.CTkFont(size=13), text_color="gray",
+            font=ctk.CTkFont(_FONT_FAMILY, size=13), text_color="gray",
         ).pack(anchor="w")
         ctk.CTkButton(
-            header, text="Cài đặt", width=100, command=self._on_settings,
+            header, text="Cài đặt", width=100, font=ctk.CTkFont(_FONT_FAMILY), command=self._on_settings,
         ).pack(side="right", padx=8)
 
         # ---- KPI cards ----
@@ -129,7 +134,7 @@ class MainWindow:
         self._alert_bar.pack(fill="x", padx=24, pady=(0, 16))
         self._alert_label = ctk.CTkLabel(
             self._alert_bar, text="Không có vi phạm.",
-            font=ctk.CTkFont(size=13), text_color="white",
+            font=ctk.CTkFont(_FONT_FAMILY, size=13), text_color="white",
         )
         self._alert_label.place(relx=0.5, rely=0.5, anchor="center")
         self._alert_bar.pack_forget()  # Ẩn khi không có vi phạm
@@ -146,21 +151,35 @@ class MainWindow:
         left_pane.pack(side="left", fill="both", expand=True, padx=(0, 12))
         cam_title = ctk.CTkFrame(left_pane, fg_color="transparent")
         cam_title.pack(fill="x", pady=(0, 8))
-        ctk.CTkLabel(cam_title, text=f"Camera công trường - {CAMERA_AREA_NAME}", font=ctk.CTkFont(size=15, weight="bold")).pack(side="left")
+        self._camera_title_label = ctk.CTkLabel(
+            cam_title, text=f"Camera công trường - {CAMERA_AREA_NAME}",
+            font=ctk.CTkFont(_FONT_FAMILY, size=15, weight="bold"),
+        )
+        self._camera_title_label.pack(side="left")
+        ctk.CTkButton(
+            cam_title, text="Mở video...", width=100, font=ctk.CTkFont(_FONT_FAMILY),
+            command=self._on_open_video,
+        ).pack(side="right", padx=4)
+        self._btn_back_camera = ctk.CTkButton(
+            cam_title, text="Quay lại camera", width=120, font=ctk.CTkFont(_FONT_FAMILY),
+            fg_color="gray", command=self._on_back_to_camera,
+        )
+        self._btn_back_camera.pack(side="right")
+        self._btn_back_camera.pack_forget()  # Chỉ hiện khi đang phát video
         self._video_container = ctk.CTkFrame(left_pane, fg_color="#2b2b2b", corner_radius=8)
         self._video_container.pack(fill="both", expand=True)
         self._video_label = ctk.CTkLabel(
             self._video_container, text="Đang kết nối camera...",
-            font=ctk.CTkFont(size=14), text_color="gray",
+            font=ctk.CTkFont(_FONT_FAMILY, size=14), text_color="gray",
         )
         self._video_label.pack(fill="both", expand=True, padx=8, pady=8)
         self._live_badge = ctk.CTkLabel(
-            self._video_container, text=" TRỰC TIẾP ", font=ctk.CTkFont(size=11, weight="bold"),
+            self._video_container, text=" TRỰC TIẾP ", font=ctk.CTkFont(_FONT_FAMILY, size=11, weight="bold"),
             fg_color="black", text_color="red", corner_radius=4,
         )
         self._live_badge.place(relx=0.02, rely=0.03, anchor="nw")
         self._rec_badge = ctk.CTkLabel(
-            self._video_container, text=" REC ", font=ctk.CTkFont(size=10),
+            self._video_container, text=" REC ", font=ctk.CTkFont(_FONT_FAMILY, size=10),
             fg_color="red", text_color="white", corner_radius=4,
         )
         self._rec_badge.place(relx=0.98, rely=0.03, anchor="ne")
@@ -171,21 +190,71 @@ class MainWindow:
         right_pane.pack_propagate(False)
         list_header = ctk.CTkFrame(right_pane, fg_color="transparent")
         list_header.pack(fill="x", pady=(0, 8))
-        ctk.CTkLabel(list_header, text="Danh sách vi phạm", font=ctk.CTkFont(size=15, weight="bold")).pack(side="left")
+        ctk.CTkLabel(list_header, text="Danh sách vi phạm", font=ctk.CTkFont(_FONT_FAMILY, size=15, weight="bold")).pack(side="left")
         self._violation_count_badge = ctk.CTkLabel(
-            list_header, text=" 0 ", font=ctk.CTkFont(size=12),
+            list_header, text=" 0 ", font=ctk.CTkFont(_FONT_FAMILY, size=12),
             fg_color="#e74c3c", text_color="white", corner_radius=10,
         )
         self._violation_count_badge.pack(side="left", padx=8)
         ctk.CTkButton(
-            list_header, text="Xóa tất cả", fg_color="transparent", text_color="gray", width=80, command=self._clear_violations,
+            list_header, text="Xóa tất cả", fg_color="transparent", text_color="gray", width=80,
+            font=ctk.CTkFont(_FONT_FAMILY), command=self._clear_violations,
         ).pack(side="right")
         self._violation_scroll = ctk.CTkScrollableFrame(right_pane, fg_color="transparent")
         self._violation_scroll.pack(fill="both", expand=True)
 
     def _on_settings(self):
-        """Mở cài đặt (placeholder)."""
-        pass
+        """Mở hộp thoại Cài đặt. Sau khi lưu sẽ khởi động lại camera để áp dụng cấu hình mới."""
+        def on_saved():
+            from src.config.settings import CAMERA_AREA_NAME, CAMERA_INDEX
+            if self._camera_thread:
+                self._camera_thread.stop()
+            self._current_source = CAMERA_INDEX
+            self._start_source()
+            self._camera_title_label.configure(text=f"Camera công trường - {CAMERA_AREA_NAME}")
+            self._btn_back_camera.pack_forget()
+            if self._video_label:
+                self._video_label.configure(text="")
+        d = SettingsDialog(self.root, on_saved=on_saved)
+        d.focus_set()
+
+    def _on_open_video(self):
+        """Chọn file video và chạy nhận diện trên video."""
+        from tkinter import filedialog
+        path = filedialog.askopenfilename(
+            title="Chọn video để test nhận diện",
+            filetypes=[
+                ("Video", "*.mp4 *.avi *.mov *.mkv *.wmv"),
+                ("MP4", "*.mp4"),
+                ("Tất cả", "*.*"),
+            ],
+        )
+        if not path:
+            return
+        if self._camera_thread:
+            self._camera_thread.stop()
+        self._current_source = path
+        self._start_source()
+        import os
+        self._camera_title_label.configure(text=f"Video: {os.path.basename(path)}")
+        self._btn_back_camera.pack(side="right", padx=4)
+        self._video_label.configure(text="")
+
+    def _on_back_to_camera(self):
+        """Chuyển từ video về camera trực tiếp."""
+        from src.config.settings import CAMERA_INDEX, CAMERA_AREA_NAME
+        if self._camera_thread:
+            self._camera_thread.stop()
+        self._current_source = CAMERA_INDEX
+        self._start_source()
+        self._camera_title_label.configure(text=f"Camera công trường - {CAMERA_AREA_NAME}")
+        self._btn_back_camera.pack_forget()
+        self._video_label.configure(text="")
+
+    def _on_video_ended(self):
+        """Gọi khi video file phát xong."""
+        if self._video_label:
+            self.root.after(0, lambda: self._video_label.configure(text="Video kết thúc."))
 
     def _clear_violations(self):
         self._violations.clear()
@@ -194,7 +263,18 @@ class MainWindow:
         self._update_alert(0)
 
     def _start_camera(self):
-        self._camera_thread = CameraThread(on_frame=self._on_frame)
+        """Khởi động lại camera (gọi từ on_saved trong Cài đặt)."""
+        from src.config.settings import CAMERA_INDEX
+        self._current_source = CAMERA_INDEX
+        self._start_source()
+
+    def _start_source(self):
+        """Khởi động nguồn hiện tại (camera hoặc file video)."""
+        self._camera_thread = CameraThread(
+            on_frame=self._on_frame,
+            source=self._current_source,
+            on_video_end=self._on_video_ended,
+        )
         self._camera_thread.start()
 
     def _on_frame(self, result: DetectionResult):
@@ -204,7 +284,7 @@ class MainWindow:
         to_add: List[Violation] = []
         for v in result.violations:
             key = v.violation_type.value
-            if now - self._last_violation_time.get(key, 0) >= 2.0:
+            if now - self._last_violation_time.get(key, 0) >= VIOLATION_THROTTLE_SECONDS:
                 to_add.append(v)
                 self._last_violation_time[key] = now
         self.root.after(0, lambda: self._on_frame_ui(result, to_add))
@@ -237,12 +317,15 @@ class MainWindow:
     def _set_video_image(self, pil_img: "Image.Image", w: int, h: int):
         if self._video_label is None:
             return
-        if self._video_image is None:
+        # CTkImage yêu cầu light_image và dark_image cùng kích thước; khi đổi nguồn (camera ↔ video) kích thước frame có thể đổi → tạo mới CTkImage thay vì configure.
+        current_size = getattr(self, "_video_image_size", None)
+        if self._video_image is None or current_size != (w, h):
+            self._video_image_size = (w, h)
             self._video_image = ctk.CTkImage(light_image=pil_img, dark_image=pil_img, size=(w, h))
             self._video_label.configure(image=self._video_image, text="")
         else:
             self._video_image.configure(light_image=pil_img, dark_image=pil_img, size=(w, h))
-        self._video_label.configure(image=self._video_image, text="")
+            self._video_label.configure(image=self._video_image, text="")
 
     def _update_kpis(self, total: int, helmet: int, vest: int, both: int):
         self._kpi_total.set_value(total)

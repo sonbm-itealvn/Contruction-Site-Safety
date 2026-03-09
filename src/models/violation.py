@@ -8,10 +8,10 @@ from typing import List, Optional, Tuple
 
 
 class ViolationType(str, Enum):
-    """Loại vi phạm trang bị bảo hộ."""
-    MISSING_HELMET = "missing_helmet"      # Thiếu mũ bảo hộ
-    MISSING_VEST = "missing_vest"          # Thiếu áo bảo hộ
-    MISSING_BOTH = "missing_both"          # Thiếu cả hai
+    """Loại vi phạm trang bị bảo hộ (theo dataset: Non-Helmet, bare-arms, ...)."""
+    MISSING_HELMET = "missing_helmet"    # Non-Helmet → Thiếu mũ bảo hộ
+    MISSING_VEST = "missing_vest"       # bare-arms → Thiếu áo bảo hộ / để lộ tay
+    MISSING_BOTH = "missing_both"       # Thiếu cả hai (tính từ detection)
 
 
 @dataclass
@@ -28,7 +28,7 @@ class Violation:
         if self.violation_type == ViolationType.MISSING_HELMET:
             return "Thiếu mũ bảo hộ"
         if self.violation_type == ViolationType.MISSING_VEST:
-            return "Thiếu áo bảo hộ"
+            return "Thiếu áo bảo hộ / Để lộ tay"
         return "Thiếu cả hai"
 
     @property
