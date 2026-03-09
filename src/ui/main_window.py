@@ -1,0 +1,277 @@
+"""
+Cửa sổ chính - Dashboard giám sát an toàn lao động.
+Giao diện: header, KPI cards, cảnh báo, camera trực tiếp, danh sách vi phạm.
+"""
+from collections import deque
+from datetime import datetime
+from typing import Deque, List
+
+import cv2
+import customtkinter as ctk
+from PIL import Image
+import numpy as np
+
+from src.config.settings import CAMERA_AREA_NAME
+from src.models import Violation, ViolationType, DetectionResult
+from src.services.camera_thread import CameraThread
+
+# Giao diện sáng
+ctk.set_appearance_mode("light")
+ctk.set_default_color_theme("blue")
+
+
+class KPICard(ctk.CTkFrame):
+    """Một thẻ thống kê (Tổng vi phạm, Thiếu mũ, ...)."""
+
+    def __init__(
+        self,
+        master,
+        title: str,
+        value: int = 0,
+        color: str = "#e74c3c",
+        icon_text: str = "⚠",
+        **kwargs,
+    ):
+        super().__init__(master, fg_color=color, corner_radius=12, **kwargs)
+        self._value_var = ctk.StringVar(value=str(value))
+        inner = ctk.CTkFrame(self, fg_color="transparent")
+        inner.pack(fill="both", expand=True, padx=16, pady=12)
+        ctk.CTkLabel(
+            inner, text=icon_text, font=ctk.CTkFont(size=28), text_color="white",
+        ).pack(anchor="w")
+        ctk.CTkLabel(
+            inner, textvariable=self._value_var, font=ctk.CTkFont(size=28, weight="bold"), text_color="white",
+        ).pack(anchor="w")
+        ctk.CTkLabel(
+            inner, text=title, font=ctk.CTkFont(size=13), text_color="white",
+        ).pack(anchor="w")
+
+    def set_value(self, value: int):
+        self._value_var.set(str(value))
+
+
+class ViolationCard(ctk.CTkFrame):
+    """Một dòng trong danh sách vi phạm."""
+
+    def __init__(self, master, violation: Violation, **kwargs):
+        if violation.violation_type == ViolationType.MISSING_BOTH:
+            color = "#c0392b"
+        elif violation.violation_type == ViolationType.MISSING_HELMET:
+            color = "#f39c12"
+        else:
+            color = "#f1c40f"
+        super().__init__(master, fg_color=color, corner_radius=8, **kwargs)
+        inner = ctk.CTkFrame(self, fg_color="transparent")
+        inner.pack(fill="both", expand=True, padx=12, pady=8)
+        icon = "⛑🦺" if violation.violation_type == ViolationType.MISSING_BOTH else ("⛑" if violation.violation_type == ViolationType.MISSING_HELMET else "🦺")
+        ctk.CTkLabel(inner, text=icon, font=ctk.CTkFont(size=20)).pack(side="left", padx=(0, 10))
+        right = ctk.CTkFrame(inner, fg_color="transparent")
+        right.pack(side="left", fill="both", expand=True)
+        ctk.CTkLabel(
+            right, text=violation.label_vi, font=ctk.CTkFont(size=14, weight="bold"), anchor="w",
+        ).pack(anchor="w")
+        ctk.CTkLabel(
+            right, text=f"{violation.time_str} · Độ chính xác: {violation.confidence_pct}", font=ctk.CTkFont(size=12), anchor="w",
+        ).pack(anchor="w")
+
+
+class MainWindow:
+    """Dashboard giám sát an toàn lao động - nhận diện real-time qua camera."""
+
+    def __init__(self):
+        self.root = ctk.CTk()
+        self.root.title("Hệ thống giám sát an toàn lao động")
+        self.root.geometry("1280x780")
+        self.root.minsize(1024, 600)
+
+        # Lưu vi phạm để hiển thị (giới hạn 100)
+        self._violations: Deque[Violation] = deque(maxlen=100)
+        self._camera_thread: CameraThread | None = None
+        self._video_image: ctk.CTkImage | None = None  # Giữ reference để cập nhật
+        self._video_label: ctk.CTkLabel | None = None
+        self._last_violation_time: dict = {}  # throttle: type -> last add time
+
+        self._setup_ui()
+        self._start_camera()
+
+    def _setup_ui(self):
+        # ---- Header ----
+        header = ctk.CTkFrame(self.root, fg_color="transparent")
+        header.pack(fill="x", padx=24, pady=16)
+        left = ctk.CTkFrame(header, fg_color="transparent")
+        left.pack(side="left", fill="y")
+        ctk.CTkLabel(
+            left, text="Hệ thống giám sát an toàn lao động",
+            font=ctk.CTkFont(size=22, weight="bold"),
+        ).pack(anchor="w")
+        ctk.CTkLabel(
+            left, text="Nhận diện vi phạm trang bị bảo hộ real-time",
+            font=ctk.CTkFont(size=13), text_color="gray",
+        ).pack(anchor="w")
+        ctk.CTkButton(
+            header, text="Cài đặt", width=100, command=self._on_settings,
+        ).pack(side="right", padx=8)
+
+        # ---- KPI cards ----
+        kpi_frame = ctk.CTkFrame(self.root, fg_color="transparent")
+        kpi_frame.pack(fill="x", padx=24, pady=(0, 12))
+        self._kpi_total = KPICard(kpi_frame, "Tổng vi phạm", 0, color="#e74c3c", icon_text="⚠")
+        self._kpi_total.pack(side="left", fill="x", expand=True, padx=4)
+        self._kpi_helmet = KPICard(kpi_frame, "Thiếu mũ bảo hộ", 0, color="#e67e22", icon_text="⛑")
+        self._kpi_helmet.pack(side="left", fill="x", expand=True, padx=4)
+        self._kpi_vest = KPICard(kpi_frame, "Thiếu áo bảo hộ", 0, color="#f1c40f", icon_text="🦺")
+        self._kpi_vest.pack(side="left", fill="x", expand=True, padx=4)
+        self._kpi_both = KPICard(kpi_frame, "Thiếu cả hai", 0, color="#c0392b", icon_text="⛑🦺")
+        self._kpi_both.pack(side="left", fill="x", expand=True, padx=4)
+
+        # ---- Alert bar ----
+        self._alert_bar = ctk.CTkFrame(self.root, fg_color="#e74c3c", corner_radius=8, height=44)
+        self._alert_bar.pack(fill="x", padx=24, pady=(0, 16))
+        self._alert_label = ctk.CTkLabel(
+            self._alert_bar, text="Không có vi phạm.",
+            font=ctk.CTkFont(size=13), text_color="white",
+        )
+        self._alert_label.place(relx=0.5, rely=0.5, anchor="center")
+        self._alert_bar.pack_forget()  # Ẩn khi không có vi phạm
+
+        self._alert_bar_placeholder = ctk.CTkFrame(self.root, fg_color="transparent", height=8)
+        self._alert_bar_placeholder.pack(fill="x")
+
+        # ---- Content: Camera + List ----
+        content = ctk.CTkFrame(self.root, fg_color="transparent")
+        content.pack(fill="both", expand=True, padx=24, pady=(0, 24))
+
+        # Left: Camera
+        left_pane = ctk.CTkFrame(content, fg_color="transparent")
+        left_pane.pack(side="left", fill="both", expand=True, padx=(0, 12))
+        cam_title = ctk.CTkFrame(left_pane, fg_color="transparent")
+        cam_title.pack(fill="x", pady=(0, 8))
+        ctk.CTkLabel(cam_title, text=f"Camera công trường - {CAMERA_AREA_NAME}", font=ctk.CTkFont(size=15, weight="bold")).pack(side="left")
+        self._video_container = ctk.CTkFrame(left_pane, fg_color="#2b2b2b", corner_radius=8)
+        self._video_container.pack(fill="both", expand=True)
+        self._video_label = ctk.CTkLabel(
+            self._video_container, text="Đang kết nối camera...",
+            font=ctk.CTkFont(size=14), text_color="gray",
+        )
+        self._video_label.pack(fill="both", expand=True, padx=8, pady=8)
+        self._live_badge = ctk.CTkLabel(
+            self._video_container, text=" TRỰC TIẾP ", font=ctk.CTkFont(size=11, weight="bold"),
+            fg_color="black", text_color="red", corner_radius=4,
+        )
+        self._live_badge.place(relx=0.02, rely=0.03, anchor="nw")
+        self._rec_badge = ctk.CTkLabel(
+            self._video_container, text=" REC ", font=ctk.CTkFont(size=10),
+            fg_color="red", text_color="white", corner_radius=4,
+        )
+        self._rec_badge.place(relx=0.98, rely=0.03, anchor="ne")
+
+        # Right: Violation list
+        right_pane = ctk.CTkFrame(content, fg_color="transparent", width=320)
+        right_pane.pack(side="right", fill="y", padx=(12, 0))
+        right_pane.pack_propagate(False)
+        list_header = ctk.CTkFrame(right_pane, fg_color="transparent")
+        list_header.pack(fill="x", pady=(0, 8))
+        ctk.CTkLabel(list_header, text="Danh sách vi phạm", font=ctk.CTkFont(size=15, weight="bold")).pack(side="left")
+        self._violation_count_badge = ctk.CTkLabel(
+            list_header, text=" 0 ", font=ctk.CTkFont(size=12),
+            fg_color="#e74c3c", text_color="white", corner_radius=10,
+        )
+        self._violation_count_badge.pack(side="left", padx=8)
+        ctk.CTkButton(
+            list_header, text="Xóa tất cả", fg_color="transparent", text_color="gray", width=80, command=self._clear_violations,
+        ).pack(side="right")
+        self._violation_scroll = ctk.CTkScrollableFrame(right_pane, fg_color="transparent")
+        self._violation_scroll.pack(fill="both", expand=True)
+
+    def _on_settings(self):
+        """Mở cài đặt (placeholder)."""
+        pass
+
+    def _clear_violations(self):
+        self._violations.clear()
+        self._refresh_violation_list()
+        self._update_kpis(0, 0, 0, 0)
+        self._update_alert(0)
+
+    def _start_camera(self):
+        self._camera_thread = CameraThread(on_frame=self._on_frame)
+        self._camera_thread.start()
+
+    def _on_frame(self, result: DetectionResult):
+        """Callback từ camera thread: throttle vi phạm rồi gửi lên main thread."""
+        import time
+        now = time.time()
+        to_add: List[Violation] = []
+        for v in result.violations:
+            key = v.violation_type.value
+            if now - self._last_violation_time.get(key, 0) >= 2.0:
+                to_add.append(v)
+                self._last_violation_time[key] = now
+        self.root.after(0, lambda: self._on_frame_ui(result, to_add))
+
+    def _on_frame_ui(self, result: DetectionResult, to_add: List[Violation]):
+        """Chạy trên main thread: cập nhật ảnh, thêm vi phạm, refresh UI."""
+        for v in to_add:
+            self._violations.append(v)
+        # Cập nhật ảnh video
+        frame = result.frame
+        if frame is not None and frame.size > 0:
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            h, w = frame_rgb.shape[:2]
+            max_w, max_h = 640, 480
+            scale = min(max_w / w, max_h / h, 1.0)
+            new_w, new_h = int(w * scale), int(h * scale)
+            if new_w > 0 and new_h > 0:
+                from PIL import Image as PILImage
+                pil_img = PILImage.fromarray(frame_rgb).resize((new_w, new_h), PILImage.Resampling.LANCZOS)
+                self._set_video_image(pil_img, new_w, new_h)
+        total = len(self._violations)
+        h_count = sum(1 for x in self._violations if x.violation_type == ViolationType.MISSING_HELMET)
+        v_count = sum(1 for x in self._violations if x.violation_type == ViolationType.MISSING_VEST)
+        b_count = sum(1 for x in self._violations if x.violation_type == ViolationType.MISSING_BOTH)
+        self._update_kpis(total, h_count, v_count, b_count)
+        if to_add:
+            self._refresh_violation_list()
+        self._update_alert(total)
+
+    def _set_video_image(self, pil_img: "Image.Image", w: int, h: int):
+        if self._video_label is None:
+            return
+        if self._video_image is None:
+            self._video_image = ctk.CTkImage(light_image=pil_img, dark_image=pil_img, size=(w, h))
+            self._video_label.configure(image=self._video_image, text="")
+        else:
+            self._video_image.configure(light_image=pil_img, dark_image=pil_img, size=(w, h))
+        self._video_label.configure(image=self._video_image, text="")
+
+    def _update_kpis(self, total: int, helmet: int, vest: int, both: int):
+        self._kpi_total.set_value(total)
+        self._kpi_helmet.set_value(helmet)
+        self._kpi_vest.set_value(vest)
+        self._kpi_both.set_value(both)
+
+    def _update_alert(self, total: int):
+        if total > 0:
+            self._alert_bar_placeholder.pack_forget()
+            self._alert_bar.pack(fill="x", padx=24, pady=(0, 16))
+            self._alert_label.configure(
+                text=f"Cảnh báo! Phát hiện {total} vi phạm an toàn lao động. Vui lòng kiểm tra và xử lý ngay lập tức."
+            )
+        else:
+            self._alert_bar.pack_forget()
+            self._alert_bar_placeholder.pack(fill="x")
+
+    def _refresh_violation_list(self):
+        for w in self._violation_scroll.winfo_children():
+            w.destroy()
+        for v in reversed(list(self._violations)):
+            card = ViolationCard(self._violation_scroll, v)
+            card.pack(fill="x", pady=4)
+        self._violation_count_badge.configure(text=f" {len(self._violations)} ")
+
+    def run(self):
+        try:
+            self.root.mainloop()
+        finally:
+            if self._camera_thread:
+                self._camera_thread.stop()
