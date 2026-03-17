@@ -22,6 +22,7 @@ class Violation:
     confidence: float  # 0-1
     timestamp: datetime
     bbox: Optional[Tuple[int, int, int, int]] = None  # x1, y1, x2, y2
+    location: Optional[str] = None  # tên khu vực / camera khi ghi nhận
 
     @property
     def label_vi(self) -> str:

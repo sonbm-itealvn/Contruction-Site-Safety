@@ -2,7 +2,10 @@
 Cửa sổ chính - Dashboard giám sát an toàn lao động.
 Giao diện: header, KPI cards, cảnh báo, camera trực tiếp, danh sách vi phạm.
 """
+import json
+import os
 from collections import deque
+from dataclasses import replace
 from datetime import datetime
 from typing import Deque, List
 
@@ -11,7 +14,20 @@ import customtkinter as ctk
 from PIL import Image
 import numpy as np
 
-from src.config.settings import CAMERA_AREA_NAME, CAMERA_INDEX, VIOLATION_THROTTLE_SECONDS
+from src.config.settings import (
+    CAMERA_AREA_NAME,
+    CAMERA_INDEX,
+    CONFIDENCE_THRESHOLD,
+    DATA_DIR,
+    MODEL_PATH,
+    PROJECT_ROOT,
+    TRACK_PERSON_ONLY,
+    USER_SETTINGS_PATH,
+    VIOLATION_THROTTLE_SECONDS,
+    load_cameras,
+    load_user_settings,
+    save_cameras,
+)
 from src.models import Violation, ViolationType, DetectionResult
 from src.services.camera_thread import CameraThread
 from src.ui.settings_dialog import SettingsDialog
@@ -91,8 +107,9 @@ class ViolationCard(ctk.CTkFrame):
         ctk.CTkLabel(
             right, text=violation.label_vi, font=ctk.CTkFont(_FONT_FAMILY, size=14, weight="bold"), text_color=_COLORS["text_primary"], anchor="w",
         ).pack(anchor="w")
+        loc = f" - {violation.location}" if getattr(violation, "location", None) else ""
         ctk.CTkLabel(
-            right, text=f"🕐 {violation.time_str} · Độ chính xác: {violation.confidence_pct}", font=ctk.CTkFont(_FONT_FAMILY, size=12), text_color=_COLORS["text_secondary"], anchor="w",
+            right, text=f"🕐 {violation.time_str}{loc} · {violation.confidence_pct}", font=ctk.CTkFont(_FONT_FAMILY, size=12), text_color=_COLORS["text_secondary"], anchor="w",
         ).pack(anchor="w")
 
 
@@ -114,30 +131,51 @@ class MainWindow:
         self._last_violation_time: dict = {}  # throttle: type -> last add time
         # Nguồn hiện tại: int = camera index, str = đường dẫn file video
         self._current_source: int | str = CAMERA_INDEX
+        # Danh sách camera (từ data/cameras.json); index đang chọn trên dashboard
+        self._cameras = load_cameras()
+        self._current_camera_index = 0
+        self._is_playing_video_file = False
+        if self._cameras:
+            self._current_source = self._cameras[0].get("source", CAMERA_INDEX)
 
         self._setup_ui()
         self._start_source()
 
     def _setup_ui(self):
-        # ---- Header ----
-        header = ctk.CTkFrame(self.root, fg_color="transparent")
-        header.pack(fill="x", padx=24, pady=16)
-        left = ctk.CTkFrame(header, fg_color="transparent")
-        left.pack(side="left", fill="y")
-        ctk.CTkLabel(
-            left, text="Hệ thống giám sát an toàn lao động",
-            font=ctk.CTkFont(_FONT_FAMILY, size=22, weight="bold"), text_color=_COLORS["text_primary"],
-        ).pack(anchor="w")
-        ctk.CTkLabel(
-            left, text="Nhận diện vi phạm trang bị bảo hộ real-time",
-            font=ctk.CTkFont(_FONT_FAMILY, size=13), text_color=_COLORS["text_secondary"],
-        ).pack(anchor="w")
-        ctk.CTkButton(
-            header, text="Cài đặt", width=100, font=ctk.CTkFont(_FONT_FAMILY), command=self._on_settings,
-        ).pack(side="right", padx=8)
+        # ---- Sidebar: 3 nút rõ chữ (Trang chủ, Camera, Cài đặt) ----
+        sidebar = ctk.CTkFrame(self.root, fg_color="#E5E7EB", width=100, corner_radius=0)
+        sidebar.pack(side="left", fill="y")
+        sidebar.pack_propagate(False)
+        ctk.CTkLabel(sidebar, text="Menu", font=ctk.CTkFont(_FONT_FAMILY, size=11, weight="bold"), text_color=_COLORS["text_secondary"]).pack(pady=(16, 10))
+        self._btn_dashboard = ctk.CTkButton(
+            sidebar, text="Trang chủ", width=84, height=44, corner_radius=10,
+            fg_color="#1E293B", hover_color="#374151", text_color="white",
+            font=ctk.CTkFont(_FONT_FAMILY, size=12), command=lambda: self._show_page("dashboard"),
+        )
+        self._btn_dashboard.pack(pady=6)
+        self._btn_cameras = ctk.CTkButton(
+            sidebar, text="Camera", width=84, height=44, corner_radius=10,
+            fg_color="transparent", hover_color="#D1D5DB", text_color=_COLORS["text_primary"],
+            font=ctk.CTkFont(_FONT_FAMILY, size=12), command=lambda: self._show_page("cameras"),
+        )
+        self._btn_cameras.pack(pady=6)
+        self._btn_settings = ctk.CTkButton(
+            sidebar, text="Cài đặt", width=84, height=44, corner_radius=10,
+            fg_color="transparent", hover_color="#D1D5DB", text_color=_COLORS["text_primary"],
+            font=ctk.CTkFont(_FONT_FAMILY, size=12), command=lambda: self._show_page("settings"),
+        )
+        self._btn_settings.pack(pady=6)
+        ctk.CTkLabel(sidebar, text="").pack(fill="y", expand=True)
+        ctk.CTkButton(sidebar, text="Tài khoản", width=84, height=36, corner_radius=10, fg_color="transparent", hover_color="#D1D5DB", font=ctk.CTkFont(_FONT_FAMILY, size=11)).pack(pady=(0, 16))
 
-        # ---- KPI cards ----
-        kpi_frame = ctk.CTkFrame(self.root, fg_color="transparent")
+        self._content = ctk.CTkFrame(self.root, fg_color="transparent")
+        self._content.pack(side="left", fill="both", expand=True, padx=20, pady=16)
+        self._dashboard_frame = ctk.CTkFrame(self._content, fg_color="transparent")
+        self._cameras_frame = ctk.CTkFrame(self._content, fg_color="transparent")
+        self._settings_frame = ctk.CTkFrame(self._content, fg_color="transparent")
+
+        # ---- KPI + LIVE ----
+        kpi_frame = ctk.CTkFrame(self._dashboard_frame, fg_color="transparent")
         kpi_frame.pack(fill="x", padx=24, pady=(0, 12))
         self._kpi_total = KPICard(kpi_frame, "Tổng vi phạm", 0, bg_color=_COLORS["total_bg"], accent_color=_COLORS["total_accent"], icon_text="⚠")
         self._kpi_total.pack(side="left", fill="x", expand=True, padx=4)
@@ -147,10 +185,11 @@ class MainWindow:
         self._kpi_vest.pack(side="left", fill="x", expand=True, padx=4)
         self._kpi_both = KPICard(kpi_frame, "Thiếu cả hai", 0, bg_color=_COLORS["both_bg"], accent_color=_COLORS["both_accent"], icon_text="⛑🦺")
         self._kpi_both.pack(side="left", fill="x", expand=True, padx=4)
+        ctk.CTkLabel(kpi_frame, text="● TRỰC TIẾP", font=ctk.CTkFont(_FONT_FAMILY, size=12, weight="bold"), text_color="#16A34A").pack(side="right", padx=12)
 
-        # ---- Alert bar: nền hồng nhạt, viền trái đỏ ----
-        self._alert_bar = ctk.CTkFrame(self.root, fg_color=_COLORS["alert_bg"], corner_radius=8, height=48, border_width=0)
-        self._alert_bar.pack(fill="x", padx=24, pady=(0, 16))
+        # ---- Alert bar ----
+        self._alert_bar = ctk.CTkFrame(self._dashboard_frame, fg_color=_COLORS["alert_bg"], corner_radius=8, height=48, border_width=0)
+        self._alert_bar.pack(fill="x", pady=(0, 12))
         # Viền trái đỏ (frame mỏng)
         alert_left_border = ctk.CTkFrame(self._alert_bar, fg_color=_COLORS["alert_border"], width=4, corner_radius=2)
         alert_left_border.place(relx=0, rely=0, relheight=1, anchor="nw")
@@ -161,37 +200,23 @@ class MainWindow:
             font=ctk.CTkFont(_FONT_FAMILY, size=13), text_color=_COLORS["alert_border"],
         )
         self._alert_label.pack()
-        self._alert_bar.pack_forget()  # Ẩn khi không có vi phạm
+        self._alert_bar.pack_forget()
 
-        self._alert_bar_placeholder = ctk.CTkFrame(self.root, fg_color="transparent", height=8)
+        self._alert_bar_placeholder = ctk.CTkFrame(self._dashboard_frame, fg_color="transparent", height=4)
         self._alert_bar_placeholder.pack(fill="x")
 
-        # ---- Content: Camera + List ----
-        content = ctk.CTkFrame(self.root, fg_color="transparent")
-        content.pack(fill="both", expand=True, padx=24, pady=(0, 24))
+        # ---- Content: Video (có nút trái/phải) + List ----
+        content = ctk.CTkFrame(self._dashboard_frame, fg_color="transparent")
+        content.pack(fill="both", expand=True)
 
-        # Left: Camera
         left_pane = ctk.CTkFrame(content, fg_color="transparent")
         left_pane.pack(side="left", fill="both", expand=True, padx=(0, 12))
-        cam_title = ctk.CTkFrame(left_pane, fg_color="transparent")
-        cam_title.pack(fill="x", pady=(0, 8))
-        self._camera_title_label = ctk.CTkLabel(
-            cam_title, text=f"Camera công trường - {CAMERA_AREA_NAME}",
-            font=ctk.CTkFont(_FONT_FAMILY, size=15, weight="bold"), text_color=_COLORS["text_primary"],
-        )
-        self._camera_title_label.pack(side="left")
-        ctk.CTkButton(
-            cam_title, text="Mở video...", width=100, font=ctk.CTkFont(_FONT_FAMILY),
-            command=self._on_open_video,
-        ).pack(side="right", padx=4)
-        self._btn_back_camera = ctk.CTkButton(
-            cam_title, text="Quay lại camera", width=120, font=ctk.CTkFont(_FONT_FAMILY),
-            fg_color="gray", command=self._on_back_to_camera,
-        )
-        self._btn_back_camera.pack(side="right")
-        self._btn_back_camera.pack_forget()  # Chỉ hiện khi đang phát video
-        self._video_container = ctk.CTkFrame(left_pane, fg_color="#1E293B", corner_radius=10)
-        self._video_container.pack(fill="both", expand=True)
+        video_row = ctk.CTkFrame(left_pane, fg_color="transparent")
+        video_row.pack(fill="both", expand=True)
+        self._btn_prev_cam = ctk.CTkButton(video_row, text="‹", width=40, height=40, corner_radius=20, fg_color="#E2E8F0", hover_color="#CBD5E1", font=ctk.CTkFont(_FONT_FAMILY, size=24), command=self._prev_camera)
+        self._btn_prev_cam.pack(side="left", padx=(0, 8), pady=40)
+        self._video_container = ctk.CTkFrame(video_row, fg_color="#1E293B", corner_radius=12)
+        self._video_container.pack(side="left", fill="both", expand=True)
         self._video_label = ctk.CTkLabel(
             self._video_container, text="Đang kết nối camera...",
             font=ctk.CTkFont(_FONT_FAMILY, size=14), text_color="gray",
@@ -207,8 +232,22 @@ class MainWindow:
             fg_color="red", text_color="white", corner_radius=4,
         )
         self._rec_badge.place(relx=0.98, rely=0.03, anchor="ne")
+        self._btn_next_cam = ctk.CTkButton(video_row, text="›", width=40, height=40, corner_radius=20, fg_color="#E2E8F0", hover_color="#CBD5E1", font=ctk.CTkFont(_FONT_FAMILY, size=24), command=self._next_camera)
+        self._btn_next_cam.pack(side="right", padx=(8, 0), pady=40)
+        cam_info = ctk.CTkFrame(left_pane, fg_color="transparent")
+        cam_info.pack(fill="x", pady=(8, 0))
+        self._camera_title_label = ctk.CTkLabel(cam_info, text="", font=ctk.CTkFont(_FONT_FAMILY, size=14, weight="bold"), text_color=_COLORS["text_primary"])
+        self._camera_title_label.pack(anchor="w")
+        self._camera_code_label = ctk.CTkLabel(cam_info, text="", font=ctk.CTkFont(_FONT_FAMILY, size=11), text_color=_COLORS["text_secondary"])
+        self._camera_code_label.pack(anchor="w")
+        cam_actions = ctk.CTkFrame(left_pane, fg_color="transparent")
+        cam_actions.pack(fill="x", pady=(4, 0))
+        ctk.CTkButton(cam_actions, text="Mở video...", width=100, font=ctk.CTkFont(_FONT_FAMILY), command=self._on_open_video).pack(side="left", padx=(0, 8))
+        self._btn_back_camera = ctk.CTkButton(cam_actions, text="Quay lại camera", width=120, fg_color="gray", font=ctk.CTkFont(_FONT_FAMILY), command=self._on_back_to_camera)
+        self._btn_back_camera.pack(side="left")
+        self._btn_back_camera.pack_forget()
 
-        # Right: Violation list - header nền trắng, bo góc
+        # Right: Hoạt động toàn cục
         right_pane = ctk.CTkFrame(content, fg_color="transparent", width=320)
         right_pane.pack(side="right", fill="y", padx=(12, 0))
         right_pane.pack_propagate(False)
@@ -217,7 +256,7 @@ class MainWindow:
         inner_header = ctk.CTkFrame(list_header, fg_color="transparent")
         inner_header.pack(fill="x", padx=14, pady=10)
         ctk.CTkLabel(inner_header, text="⚠", font=ctk.CTkFont(_FONT_FAMILY, size=18), text_color=_COLORS["total_accent"]).pack(side="left", padx=(0, 6))
-        ctk.CTkLabel(inner_header, text="Danh sách vi phạm", font=ctk.CTkFont(_FONT_FAMILY, size=15, weight="bold"), text_color=_COLORS["text_primary"]).pack(side="left")
+        ctk.CTkLabel(inner_header, text="HOẠT ĐỘNG TOÀN CỤC", font=ctk.CTkFont(_FONT_FAMILY, size=13, weight="bold"), text_color=_COLORS["text_primary"]).pack(side="left")
         self._violation_count_badge = ctk.CTkLabel(
             inner_header, text=" 0 ", font=ctk.CTkFont(_FONT_FAMILY, size=12),
             fg_color=_COLORS["total_accent"], text_color="white", corner_radius=10,
@@ -230,20 +269,361 @@ class MainWindow:
         self._violation_scroll = ctk.CTkScrollableFrame(right_pane, fg_color="transparent")
         self._violation_scroll.pack(fill="both", expand=True)
 
+        self._build_cameras_page()
+        self._build_settings_page()
+        self._show_page("dashboard")
+        self._update_camera_labels()
+
+    def _show_page(self, name: str):
+        self._dashboard_frame.pack_forget()
+        self._cameras_frame.pack_forget()
+        self._settings_frame.pack_forget()
+        if name == "dashboard":
+            self._dashboard_frame.pack(fill="both", expand=True)
+            self._btn_dashboard.configure(fg_color="#1E293B", text_color="white")
+            self._btn_cameras.configure(fg_color="transparent", text_color=_COLORS["text_primary"])
+            self._btn_settings.configure(fg_color="transparent", text_color=_COLORS["text_primary"])
+        elif name == "cameras":
+            self._cameras_frame.pack(fill="both", expand=True)
+            self._btn_dashboard.configure(fg_color="transparent", text_color=_COLORS["text_primary"])
+            self._btn_cameras.configure(fg_color="#1E293B", text_color="white")
+            self._btn_settings.configure(fg_color="transparent", text_color=_COLORS["text_primary"])
+        else:
+            self._settings_frame.pack(fill="both", expand=True)
+            self._btn_dashboard.configure(fg_color="transparent", text_color=_COLORS["text_primary"])
+            self._btn_cameras.configure(fg_color="transparent", text_color=_COLORS["text_primary"])
+            self._btn_settings.configure(fg_color="#1E293B", text_color="white")
+
+    def _build_cameras_page(self):
+        # Header: "Lưới Camera" trái, "X LUỒNG ĐANG HOẠT ĐỘNG" phải
+        header = ctk.CTkFrame(self._cameras_frame, fg_color="transparent")
+        header.pack(fill="x", pady=(0, 16))
+        ctk.CTkLabel(
+            header, text="Lưới Camera",
+            font=ctk.CTkFont(_FONT_FAMILY, size=22, weight="bold"),
+            text_color=_COLORS["text_primary"],
+        ).pack(side="left")
+        n_active = len(self._cameras)
+        ctk.CTkLabel(
+            header, text=f"{n_active} LUỒNG ĐANG HOẠT ĐỘNG",
+            font=ctk.CTkFont(_FONT_FAMILY, size=12),
+            text_color=_COLORS["text_secondary"],
+        ).pack(side="right")
+        # Lưới 2x2 (2 cột) giống ảnh
+        grid = ctk.CTkFrame(self._cameras_frame, fg_color="transparent")
+        grid.pack(fill="both", expand=True)
+        cols = 2
+        for c in range(cols):
+            grid.columnconfigure(c, weight=1)
+        for i, cam in enumerate(self._cameras):
+            row, col = i // cols, i % cols
+            card = ctk.CTkFrame(grid, fg_color="#1E293B", corner_radius=12, border_width=0)
+            card.grid(row=row, column=col, padx=8, pady=8, sticky="nsew")
+            grid.rowconfigure(row, weight=1)
+            # Preview chiếm full thẻ; badge TRỰC TIẾP góc trên-phải
+            preview = ctk.CTkFrame(card, fg_color="#1E293B", corner_radius=12)
+            preview.pack(fill="both", expand=True)
+            ctk.CTkLabel(
+                preview, text=" TRỰC TIẾP ",
+                font=ctk.CTkFont(_FONT_FAMILY, size=10),
+                fg_color="#16A34A", text_color="white", corner_radius=4,
+            ).place(relx=0.98, rely=0.06, anchor="ne")
+            # Tên + mã camera overlay góc dưới-trái, chữ trắng
+            bottom = ctk.CTkFrame(preview, fg_color="transparent")
+            bottom.place(relx=0, rely=1, anchor="sw", relwidth=1, y=-12, x=12)
+            ctk.CTkLabel(
+                bottom, text=cam.get("name", "Camera"),
+                font=ctk.CTkFont(_FONT_FAMILY, size=16, weight="bold"),
+                text_color="white",
+            ).pack(anchor="w")
+            ctk.CTkLabel(
+                bottom, text=cam.get("id", "CAM-?"),
+                font=ctk.CTkFont(_FONT_FAMILY, size=12),
+                text_color="#E2E8F0",
+            ).pack(anchor="w")
+            def _go(idx):
+                self._switch_to_camera_index(idx)
+                self._show_page("dashboard")
+            card.bind("<Button-1>", lambda e, idx=i: _go(idx))
+            for ch in card.winfo_children():
+                ch.bind("<Button-1>", lambda e, idx=i: _go(idx))
+        # Thẻ "Thêm camera" bên dưới lưới (viền đứt, icon + chữ)
+        add_row = len(self._cameras) // cols
+        add_col = len(self._cameras) % cols
+        grid.rowconfigure(add_row, weight=1)
+        add_card = ctk.CTkFrame(
+            grid, fg_color="#F1F5F9", corner_radius=12,
+            border_width=2, border_color="#94A3B8",
+        )
+        add_card.grid(row=add_row, column=add_col, padx=8, pady=8, sticky="nsew")
+        inner = ctk.CTkFrame(add_card, fg_color="transparent")
+        inner.pack(fill="both", expand=True)
+        ctk.CTkLabel(
+            inner, text="➕",
+            font=ctk.CTkFont(_FONT_FAMILY, size=40),
+            text_color=_COLORS["text_secondary"],
+        ).pack(pady=(20, 8))
+        ctk.CTkLabel(
+            inner, text="Thêm camera",
+            font=ctk.CTkFont(_FONT_FAMILY, size=14, weight="bold"),
+            text_color=_COLORS["text_primary"],
+        ).pack()
+        ctk.CTkButton(inner, text="Thêm", width=100, command=self._on_add_camera).pack(pady=(12, 20))
+
+    def _build_settings_page(self):
+        """Màn Cài đặt full-page: Độ nhạy nhận diện, Lưu trữ & hệ thống, Camera & Model."""
+        main = ctk.CTkFrame(self._settings_frame, fg_color="transparent")
+        main.pack(fill="both", expand=True)
+        scroll = ctk.CTkScrollableFrame(main, fg_color="transparent")
+        scroll.pack(fill="both", expand=True)
+
+        # ---- Tiêu đề ----
+        ctk.CTkLabel(
+            scroll, text="Cài đặt hệ thống",
+            font=ctk.CTkFont(_FONT_FAMILY, size=22, weight="bold"),
+            text_color=_COLORS["text_primary"],
+        ).pack(anchor="w", pady=(0, 20))
+
+        def _card(title: str):
+            wrap = ctk.CTkFrame(scroll, fg_color="transparent")
+            wrap.pack(fill="x", pady=(0, 16))
+            ctk.CTkLabel(
+                wrap, text=title,
+                font=ctk.CTkFont(_FONT_FAMILY, size=12, weight="bold"),
+                text_color=_COLORS["text_secondary"],
+            ).pack(anchor="w", pady=(0, 8))
+            card = ctk.CTkFrame(
+                wrap, fg_color="white", corner_radius=12,
+                border_width=1, border_color="#E2E8F0",
+            )
+            card.pack(fill="x")
+            inner = ctk.CTkFrame(card, fg_color="transparent")
+            inner.pack(fill="x", padx=20, pady=16)
+            return inner
+
+        # ---- Section 1: ĐỘ NHẠY NHẬN DIỆN ----
+        s1 = _card("ĐỘ NHẠY NHẬN DIỆN")
+        ctk.CTkLabel(s1, text="Ngưỡng tin cậy", font=ctk.CTkFont(_FONT_FAMILY, size=12), text_color=_COLORS["text_primary"]).pack(anchor="w", pady=(0, 6))
+        row_slider = ctk.CTkFrame(s1, fg_color="transparent")
+        row_slider.pack(fill="x", pady=(0, 16))
+        self._settings_confidence_label = ctk.CTkLabel(
+            row_slider, text="85%",
+            font=ctk.CTkFont(_FONT_FAMILY, size=12),
+            text_color=_COLORS["text_secondary"],
+        )
+        self._settings_confidence_label.pack(side="right", padx=(0, 0))
+        self._settings_confidence_slider = ctk.CTkSlider(
+            row_slider, from_=10, to=95, number_of_steps=85,
+            width=300, height=16, command=self._on_settings_confidence_slider,
+        )
+        self._settings_confidence_slider.pack(side="left", fill="x", expand=True, padx=(0, 12))
+        self._settings_confidence_slider.set(int(CONFIDENCE_THRESHOLD * 100))
+
+        def _toggle_row(parent, icon_text: str, label: str, initial_on: bool = False):
+            row = ctk.CTkFrame(parent, fg_color="transparent")
+            row.pack(fill="x", pady=(0, 10))
+            ctk.CTkLabel(row, text=icon_text, font=ctk.CTkFont(_FONT_FAMILY, size=16), text_color=_COLORS["text_primary"]).pack(side="left", padx=(0, 8))
+            ctk.CTkLabel(row, text=label, font=ctk.CTkFont(_FONT_FAMILY, size=13), text_color=_COLORS["text_primary"]).pack(side="left", fill="x", expand=True)
+            sw = ctk.CTkSwitch(row, text="", width=40)
+            sw.pack(side="right")
+            if initial_on:
+                sw.select()
+            else:
+                sw.deselect()
+            return sw
+
+        _toggle_row(s1, "🛡", "Nhận diện mũ", initial_on=True)  # luôn bật, không lưu
+        self._settings_track_switch = _toggle_row(s1, "⚡", "Theo dõi chuyển động", initial_on=TRACK_PERSON_ONLY)
+
+        # ---- Section 2: LƯU TRỮ & HỆ THỐNG (giống ảnh) ----
+        s2 = _card("LƯU TRỮ & HỆ THỐNG")
+        row_storage = ctk.CTkFrame(s2, fg_color="transparent")
+        row_storage.pack(fill="x", pady=(0, 12))
+        ctk.CTkLabel(row_storage, text="📦", font=ctk.CTkFont(_FONT_FAMILY, size=16)).pack(side="left", padx=(0, 8))
+        ctk.CTkLabel(row_storage, text="Dung lượng đám mây", font=ctk.CTkFont(_FONT_FAMILY, size=12, weight="bold"), text_color=_COLORS["text_primary"]).pack(side="left", fill="x", expand=True)
+        ctk.CTkButton(row_storage, text="QUẢN LÝ", width=90, height=28, fg_color="#64748B", hover_color="#475569", font=ctk.CTkFont(_FONT_FAMILY, size=11)).pack(side="right")
+        ctk.CTkLabel(s2, text="1.2 TB / 2.0 TB đã dùng", font=ctk.CTkFont(_FONT_FAMILY, size=11), text_color=_COLORS["text_secondary"]).pack(anchor="w", pady=(0, 6))
+        progress = ctk.CTkProgressBar(s2, width=400, height=8, progress_color="#2563EB", fg_color="#E2E8F0")
+        progress.pack(fill="x", pady=(0, 16))
+        progress.set(0.6)
+        row_backup = ctk.CTkFrame(s2, fg_color="transparent")
+        row_backup.pack(fill="x")
+        ctk.CTkLabel(row_backup, text="🔄", font=ctk.CTkFont(_FONT_FAMILY, size=16)).pack(side="left", padx=(0, 8))
+        ctk.CTkLabel(row_backup, text="Tự động sao lưu", font=ctk.CTkFont(_FONT_FAMILY, size=12, weight="bold"), text_color=_COLORS["text_primary"]).pack(side="left", fill="x", expand=True)
+        ctk.CTkSwitch(row_backup, text="").pack(side="right")
+        ctk.CTkLabel(s2, text="Hàng ngày lúc 02:00 AM", font=ctk.CTkFont(_FONT_FAMILY, size=11), text_color=_COLORS["text_secondary"]).pack(anchor="w", pady=(4, 0))
+
+        # ---- Section 3: Camera & Model ----
+        s3 = _card("CAMERA & MODEL")
+        ctk.CTkLabel(s3, text="Index camera", font=ctk.CTkFont(_FONT_FAMILY, size=12), text_color=_COLORS["text_primary"]).pack(anchor="w", pady=(0, 4))
+        self._settings_camera_index = ctk.CTkEntry(s3, placeholder_text="0", height=36, width=320)
+        self._settings_camera_index.pack(fill="x", pady=(0, 10))
+        ctk.CTkLabel(s3, text="Tên khu vực", font=ctk.CTkFont(_FONT_FAMILY, size=12), text_color=_COLORS["text_primary"]).pack(anchor="w", pady=(0, 4))
+        self._settings_area_name = ctk.CTkEntry(s3, placeholder_text="Khu vực A", height=36, width=320)
+        self._settings_area_name.pack(fill="x", pady=(0, 10))
+        ctk.CTkLabel(s3, text="Throttle (giây)", font=ctk.CTkFont(_FONT_FAMILY, size=12), text_color=_COLORS["text_primary"]).pack(anchor="w", pady=(0, 4))
+        self._settings_throttle = ctk.CTkEntry(s3, placeholder_text="0.8", height=36, width=320)
+        self._settings_throttle.pack(fill="x", pady=(0, 10))
+        ctk.CTkLabel(s3, text="Đường dẫn model .pt", font=ctk.CTkFont(_FONT_FAMILY, size=12), text_color=_COLORS["text_primary"]).pack(anchor="w", pady=(0, 4))
+        self._settings_model_path = ctk.CTkEntry(s3, placeholder_text="helmet_best.pt", height=36, width=320)
+        self._settings_model_path.pack(fill="x", pady=(0, 4))
+        self._settings_confidence_label.configure(text=f"{int(CONFIDENCE_THRESHOLD * 100)}%")
+        self._settings_camera_index.insert(0, str(CAMERA_INDEX))
+        self._settings_area_name.insert(0, CAMERA_AREA_NAME)
+        self._settings_throttle.insert(0, str(VIOLATION_THROTTLE_SECONDS))
+        if MODEL_PATH and os.path.isabs(MODEL_PATH):
+            self._settings_model_path.insert(0, MODEL_PATH)
+        else:
+            self._settings_model_path.insert(0, os.path.basename(MODEL_PATH) if MODEL_PATH else "")
+
+        # ---- Footer: nút Lưu cài đặt ----
+        sep = ctk.CTkFrame(main, fg_color="#E2E8F0", height=1)
+        sep.pack(fill="x", pady=(16, 12))
+        btn_frame = ctk.CTkFrame(main, fg_color="transparent")
+        btn_frame.pack(fill="x")
+        ctk.CTkButton(
+            btn_frame, text="Lưu cài đặt",
+            width=140, height=40,
+            fg_color="#2563EB", hover_color="#1D4ED8",
+            font=ctk.CTkFont(_FONT_FAMILY, size=13, weight="bold"),
+            command=self._save_settings_page,
+        ).pack(side="right")
+
+    def _on_settings_confidence_slider(self, value):
+        if hasattr(self, "_settings_confidence_label") and self._settings_confidence_label.winfo_exists():
+            self._settings_confidence_label.configure(text=f"{int(value)}%")
+
+    def _save_settings_page(self):
+        """Lưu từ màn Cài đặt (ghi settings.json, reload, áp dụng camera)."""
+        try:
+            camera_index = int((self._settings_camera_index.get() or "").strip() or "0")
+        except ValueError:
+            camera_index = 0
+        area_name = (self._settings_area_name.get() or "").strip() or CAMERA_AREA_NAME
+        area_name = area_name[:80]
+        try:
+            confidence = float(self._settings_confidence_slider.get()) / 100.0
+            confidence = max(0.1, min(0.95, confidence))
+        except Exception:
+            confidence = CONFIDENCE_THRESHOLD
+        try:
+            throttle = float((self._settings_throttle.get() or "").strip() or "0.8")
+            throttle = max(0.2, min(10.0, throttle))
+        except ValueError:
+            throttle = VIOLATION_THROTTLE_SECONDS
+        model_path = (self._settings_model_path.get() or "").strip()
+        if model_path and not os.path.isabs(model_path):
+            model_path = os.path.join(PROJECT_ROOT, model_path)
+        track_person_only = bool(self._settings_track_switch.get()) if hasattr(self, "_settings_track_switch") and self._settings_track_switch.winfo_exists() else TRACK_PERSON_ONLY
+
+        data = {
+            "camera_index": camera_index,
+            "camera_area_name": area_name,
+            "confidence_threshold": confidence,
+            "violation_throttle_seconds": throttle,
+            "model_path": model_path or None,
+            "track_person_only": track_person_only,
+        }
+        os.makedirs(DATA_DIR, exist_ok=True)
+        with open(USER_SETTINGS_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        load_user_settings()
+        if self._camera_thread:
+            self._camera_thread.stop()
+        self._cameras = load_cameras()
+        self._is_playing_video_file = False
+        self._apply_current_camera()
+        if hasattr(self, "_btn_back_camera") and self._btn_back_camera.winfo_ismapped():
+            self._btn_back_camera.pack_forget()
+
+    def _prev_camera(self):
+        if self._is_playing_video_file or not self._cameras:
+            return
+        self._current_camera_index = (self._current_camera_index - 1) % len(self._cameras)
+        self._apply_current_camera()
+
+    def _next_camera(self):
+        if self._is_playing_video_file or not self._cameras:
+            return
+        self._current_camera_index = (self._current_camera_index + 1) % len(self._cameras)
+        self._apply_current_camera()
+
+    def _switch_to_camera_index(self, index: int):
+        if not self._cameras:
+            return
+        self._current_camera_index = max(0, min(index, len(self._cameras) - 1))
+        self._is_playing_video_file = False
+        self._apply_current_camera()
+
+    def _apply_current_camera(self):
+        if self._camera_thread:
+            self._camera_thread.stop()
+        self._current_source = self._cameras[self._current_camera_index].get("source", 0) if self._cameras else CAMERA_INDEX
+        self._start_source()
+        self._update_camera_labels()
+
+    def _current_camera_name(self) -> str:
+        if self._is_playing_video_file:
+            return "Video"
+        if self._cameras and 0 <= self._current_camera_index < len(self._cameras):
+            return self._cameras[self._current_camera_index].get("name", "Camera")
+        return CAMERA_AREA_NAME
+
+    def _update_camera_labels(self):
+        if self._is_playing_video_file:
+            return
+        if self._cameras and 0 <= self._current_camera_index < len(self._cameras):
+            c = self._cameras[self._current_camera_index]
+            self._camera_title_label.configure(text=c.get("name", "Camera"))
+            self._camera_code_label.configure(text=f"MÃ CAMERA: {c.get('id', 'CAM-?')} • Live")
+        else:
+            self._camera_title_label.configure(text=CAMERA_AREA_NAME)
+            self._camera_code_label.configure(text="MÃ CAMERA: CAM-1 • Live")
+
+    def _on_add_camera(self):
+        d = ctk.CTkToplevel(self.root)
+        d.title("Thêm camera IP")
+        d.geometry("400x260")
+        d.transient(self.root)
+        f = ctk.CTkFrame(d, fg_color="transparent")
+        f.pack(fill="both", expand=True, padx=20, pady=20)
+        ctk.CTkLabel(f, text="Tên khu vực", font=ctk.CTkFont(_FONT_FAMILY, size=12)).pack(anchor="w")
+        name_entry = ctk.CTkEntry(f, placeholder_text="Ví dụ: Khu vực C", width=320)
+        name_entry.pack(fill="x", pady=(4, 12))
+        ctk.CTkLabel(f, text="Mã camera (CAM-x)", font=ctk.CTkFont(_FONT_FAMILY, size=12)).pack(anchor="w")
+        id_entry = ctk.CTkEntry(f, placeholder_text="CAM-5", width=320)
+        id_entry.pack(fill="x", pady=(4, 12))
+        ctk.CTkLabel(f, text="Nguồn (số index 0,1,2... hoặc URL RTSP)", font=ctk.CTkFont(_FONT_FAMILY, size=12)).pack(anchor="w")
+        source_entry = ctk.CTkEntry(f, placeholder_text="0 hoặc rtsp://...", width=320)
+        source_entry.pack(fill="x", pady=(4, 16))
+        def do_add():
+            name = (name_entry.get() or "").strip() or "Camera mới"
+            id_val = (id_entry.get() or "").strip() or f"CAM-{len(self._cameras)+1}"
+            src = source_entry.get().strip()
+            try:
+                src = int(src) if src and src.isdigit() else src
+            except ValueError:
+                src = 0
+            self._cameras.append({"name": name, "id": id_val, "source": src})
+            save_cameras(self._cameras)
+            d.destroy()
+            self._cameras_frame.destroy()
+            self._cameras_frame = ctk.CTkFrame(self._content, fg_color="transparent")
+            self._build_cameras_page()
+            self._cameras_frame.pack_forget()
+            self._dashboard_frame.pack(fill="both", expand=True)
+        ctk.CTkButton(f, text="Thêm", width=100, command=do_add).pack(anchor="w")
+
     def _on_settings(self):
-        """Mở hộp thoại Cài đặt. Sau khi lưu sẽ khởi động lại camera để áp dụng cấu hình mới."""
         def on_saved():
-            from src.config.settings import CAMERA_AREA_NAME, CAMERA_INDEX
+            from src.config.settings import load_cameras as reload_cameras
             if self._camera_thread:
                 self._camera_thread.stop()
-            self._current_source = CAMERA_INDEX
-            self._start_source()
-            self._camera_title_label.configure(text=f"Camera công trường - {CAMERA_AREA_NAME}")
+            self._cameras = reload_cameras()
+            self._is_playing_video_file = False
+            self._apply_current_camera()
             self._btn_back_camera.pack_forget()
-            if self._video_label:
-                self._video_label.configure(text="")
-        d = SettingsDialog(self.root, on_saved=on_saved)
-        d.focus_set()
+        SettingsDialog(self.root, on_saved=on_saved).focus_set()
 
     def _on_open_video(self):
         """Chọn file video và chạy nhận diện trên video."""
@@ -261,20 +641,19 @@ class MainWindow:
         if self._camera_thread:
             self._camera_thread.stop()
         self._current_source = path
+        self._is_playing_video_file = True
         self._start_source()
         import os
         self._camera_title_label.configure(text=f"Video: {os.path.basename(path)}")
-        self._btn_back_camera.pack(side="right", padx=4)
+        self._camera_code_label.configure(text="Phát file video")
+        self._btn_back_camera.pack(side="left", padx=(0, 8))
         self._video_label.configure(text="")
 
     def _on_back_to_camera(self):
-        """Chuyển từ video về camera trực tiếp."""
-        from src.config.settings import CAMERA_INDEX, CAMERA_AREA_NAME
+        self._is_playing_video_file = False
         if self._camera_thread:
             self._camera_thread.stop()
-        self._current_source = CAMERA_INDEX
-        self._start_source()
-        self._camera_title_label.configure(text=f"Camera công trường - {CAMERA_AREA_NAME}")
+        self._apply_current_camera()
         self._btn_back_camera.pack_forget()
         self._video_label.configure(text="")
 
@@ -318,8 +697,9 @@ class MainWindow:
 
     def _on_frame_ui(self, result: DetectionResult, to_add: List[Violation]):
         """Chạy trên main thread: cập nhật ảnh, thêm vi phạm, refresh UI."""
+        loc = self._current_camera_name()
         for v in to_add:
-            self._violations.append(v)
+            self._violations.append(replace(v, location=loc))
         # Cập nhật ảnh video
         frame = result.frame
         if frame is not None and frame.size > 0:
