@@ -1,5 +1,7 @@
 # Data Augmentation cho YOLOv26 — Thích nghi điều kiện môi trường
 
+**Quy trình chi tiết (bước làm, chạy script, dùng cho train):** xem [Quy trình Data Augmentation](QUY_TRINH_AUGMENTATION.md).
+
 Module augmentation giúp **làm khó** mô hình khi train, mô phỏng nhiều điều kiện thực tế (ánh sáng, thời tiết, nhiễu, góc máy, che khuất) để model PPE (mũ/áo bảo hộ) hoạt động ổn định trên công trường.
 
 ## Các nhóm augmentation
