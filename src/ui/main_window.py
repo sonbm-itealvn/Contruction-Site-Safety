@@ -465,8 +465,20 @@ class MainWindow:
         self._settings_throttle = ctk.CTkEntry(s3, placeholder_text="0.8", height=36, width=320)
         self._settings_throttle.pack(fill="x", pady=(0, 10))
         ctk.CTkLabel(s3, text="Đường dẫn model .pt", font=ctk.CTkFont(_FONT_FAMILY, size=12), text_color=_COLORS["text_primary"]).pack(anchor="w", pady=(0, 4))
-        self._settings_model_path = ctk.CTkEntry(s3, placeholder_text="helmet_best.pt", height=36, width=320)
-        self._settings_model_path.pack(fill="x", pady=(0, 4))
+        model_row = ctk.CTkFrame(s3, fg_color="transparent")
+        model_row.pack(fill="x", pady=(0, 4))
+        self._settings_model_path = ctk.CTkEntry(model_row, placeholder_text="helmet_best.pt", height=36)
+        self._settings_model_path.pack(side="left", fill="x", expand=True)
+        ctk.CTkButton(
+            model_row,
+            text="Chọn file...",
+            width=110,
+            height=36,
+            fg_color="#64748B",
+            hover_color="#475569",
+            font=ctk.CTkFont(_FONT_FAMILY, size=11, weight="bold"),
+            command=self._pick_model_file_for_settings_page,
+        ).pack(side="right", padx=(10, 0))
         self._settings_confidence_label.configure(text=f"{int(CONFIDENCE_THRESHOLD * 100)}%")
         self._settings_camera_index.insert(0, str(CAMERA_INDEX))
         self._settings_area_name.insert(0, CAMERA_AREA_NAME)
@@ -492,6 +504,23 @@ class MainWindow:
     def _on_settings_confidence_slider(self, value):
         if hasattr(self, "_settings_confidence_label") and self._settings_confidence_label.winfo_exists():
             self._settings_confidence_label.configure(text=f"{int(value)}%")
+
+    def _pick_model_file_for_settings_page(self):
+        from tkinter import filedialog
+
+        selected_path = filedialog.askopenfilename(
+            title="Chọn file model (.pt)",
+            filetypes=[
+                ("PyTorch model", "*.pt"),
+                ("Tất cả", "*.*"),
+            ],
+        )
+        if not selected_path:
+            return
+        if not hasattr(self, "_settings_model_path") or not self._settings_model_path.winfo_exists():
+            return
+        self._settings_model_path.delete(0, "end")
+        self._settings_model_path.insert(0, selected_path)
 
     def _save_settings_page(self):
         """Lưu từ màn Cài đặt (ghi settings.json, reload, áp dụng camera)."""

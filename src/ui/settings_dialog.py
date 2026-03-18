@@ -6,6 +6,7 @@ import os
 import sys
 
 import customtkinter as ctk
+from tkinter import filedialog
 
 from src.config import settings
 
@@ -131,6 +132,16 @@ class SettingsDialog(ctk.CTkToplevel):
         # ---- Section 3: Model ----
         s3 = self._section(scroll, "Model YOLO")
         self._model_path = self._row(s3, "Đường dẫn file .pt", "File model train 7 class PPE", "helmet_best.pt")
+        ctk.CTkButton(
+            s3,
+            text="Chọn file...",
+            width=110,
+            height=34,
+            fg_color=_COLORS["btn_secondary"],
+            hover_color="#475569",
+            font=ctk.CTkFont(_FONT_FAMILY, size=11, weight="bold"),
+            command=self._pick_model_file,
+        ).pack(anchor="w", pady=(6, 0))
 
         # ---- Nút cố định dưới cùng (ngoài scroll) ----
         sep = ctk.CTkFrame(main, fg_color=_COLORS["card_border"], height=1)
@@ -168,6 +179,19 @@ class SettingsDialog(ctk.CTkToplevel):
             self._model_path.insert(0, mp)
         else:
             self._model_path.insert(0, os.path.basename(mp) if mp else "")
+
+    def _pick_model_file(self):
+        selected_path = filedialog.askopenfilename(
+            title="Chọn file model (.pt)",
+            filetypes=[
+                ("PyTorch model", "*.pt"),
+                ("Tất cả", "*.*"),
+            ],
+        )
+        if not selected_path:
+            return
+        self._model_path.delete(0, "end")
+        self._model_path.insert(0, selected_path)
 
     def _save(self):
         try:
