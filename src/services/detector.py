@@ -1,20 +1,24 @@
 """
-Nhận diện vi phạm trang bị bảo hộ trên ảnh từ camera.
+Nhận diện vi phạm PPE + tracking bằng ByteTrack (qua ultralytics model.track).
 Dataset nhãn: "Gloves", "Helmet", "Non-Helmet", "Person", "Shoes", "Vest", "bare-arms".
-Vẽ toàn bộ bounding box model detect (để kiểm tra mô hình); vi phạm (Non-Helmet, bare-arms) vẫn dùng cho KPI/danh sách.
 """
 import uuid
+from dataclasses import dataclass, field
 from datetime import datetime
-from typing import List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Set, Tuple
 
 import cv2
 import numpy as np
 
-from src.config.settings import CONFIDENCE_THRESHOLD, DETECT_IMGSZ, MODEL_PATH, YOLO26_MODEL
+from src.config.settings import (
+    CONFIDENCE_THRESHOLD,
+    DETECT_IMGSZ,
+    MODEL_PATH,
+    USE_HALF_PRECISION,
+    YOLO26_MODEL,
+)
 from src.models import Violation, ViolationType
 
-
-# Thứ tự class phải khớp với file train (data.yaml) khi train model
 DATASET_CLASS_NAMES = [
     "Gloves",      # 0
     "Helmet",      # 1
@@ -25,18 +29,41 @@ DATASET_CLASS_NAMES = [
     "bare-arms",   # 6  → vi phạm
 ]
 
-# Map class index → loại vi phạm (chỉ class thể hiện vi phạm trực tiếp)
+PERSON_CLS_ID = 3
+
 CLASS_INDEX_TO_VIOLATION = {
     2: ViolationType.MISSING_HELMET,   # Non-Helmet
-    6: ViolationType.MISSING_VEST,     # bare-arms (thiếu áo bảo hộ / để lộ tay)
+    6: ViolationType.MISSING_VEST,     # bare-arms
 }
+
+BOX_COLORS = {
+    0: (255, 200, 0),   # Gloves - cyan-ish
+    1: (0, 200, 0),     # Helmet - green
+    2: (0, 0, 255),     # Non-Helmet - red
+    3: (255, 180, 0),   # Person - orange
+    4: (200, 200, 0),   # Shoes - teal
+    5: (0, 255, 200),   # Vest - green-cyan
+    6: (0, 80, 255),    # bare-arms - dark red
+}
+
+VIOLATION_COLOR = (0, 0, 255)
+PERSON_OK_COLOR = (0, 200, 0)
+PERSON_VIOLATION_COLOR = (0, 0, 255)
+
+
+@dataclass
+class TrackingResult:
+    """Kết quả tracking một frame."""
+    persons: List[dict] = field(default_factory=list)
+    all_boxes: List[dict] = field(default_factory=list)
+    person_violations: Dict[int, Set[ViolationType]] = field(default_factory=dict)
 
 
 class PPEDetector:
     """
-    Phát hiện vi phạm PPE theo dataset: Non-Helmet, bare-arms.
-    - MODEL_PATH = file .pt (model train với 7 class trên) → dùng model đó.
-    - MODEL_PATH = None → dùng YOLO26 pretrained (không có class PPE, chạy chế độ mẫu khi cần).
+    Phát hiện PPE + tracking ByteTrack.
+    - track_frame(): chạy model.track(persist=True), trả TrackingResult với person IDs
+    - draw_tracking_frame(): vẽ bounding box + person ID lên frame
     """
 
     CLASS_NAMES = DATASET_CLASS_NAMES
@@ -52,6 +79,8 @@ class PPEDetector:
         self.yolo26_model = yolo26_model or YOLO26_MODEL
         self.conf_threshold = confidence_threshold
         self._model = None
+        self._names_list: List[str] = list(DATASET_CLASS_NAMES)
+        self._use_half = False
         self._load_model()
 
     def _load_model(self):
@@ -60,52 +89,56 @@ class PPEDetector:
             if self.model_path:
                 self._model = YOLO(self.model_path)
                 print(f"[PPEDetector] Đã load model PPE: {self.model_path}")
-                print(f"[PPEDetector] Nhãn: {self.CLASS_NAMES}. Vi phạm: Non-Helmet (2), bare-arms (6).")
             else:
                 self._model = YOLO(self.yolo26_model)
-                print(f"[PPEDetector] YOLOv26: {self.yolo26_model}. Đặt MODEL_PATH để dùng model PPE.")
+                print(f"[PPEDetector] YOLOv26: {self.yolo26_model}")
+
+            class_names = getattr(self._model, "names", None) or DATASET_CLASS_NAMES
+            if isinstance(class_names, dict):
+                max_id = max(class_names.keys()) if class_names else 0
+                self._names_list = [class_names.get(i, str(i)) for i in range(max_id + 1)]
+            else:
+                self._names_list = list(class_names) if class_names else []
+
+            if USE_HALF_PRECISION:
+                import torch
+                if torch.cuda.is_available():
+                    self._use_half = True
+                    print("[PPEDetector] GPU CUDA detected → FP16 enabled")
+                else:
+                    print("[PPEDetector] No CUDA → FP16 disabled, using CPU")
+        except ImportError:
+            pass
         except Exception as e:
-            print(f"[PPEDetector] Lỗi load model: {e}. Chạy chế độ mẫu.")
+            print(f"[PPEDetector] Lỗi load model: {e}")
             self._model = None
 
-    def detect(self, frame: np.ndarray) -> List[Violation]:
-        """
-        Nhận diện vi phạm trên frame BGR.
-        Chỉ báo vi phạm khi model detect class Non-Helmet (2) hoặc bare-arms (6).
-        """
-        if self._model is not None:
-            return self._detect_yolo(frame)
-        return self._detect_demo(frame)
+    # ------------------------------------------------------------------
+    # Tracking API (chính)
+    # ------------------------------------------------------------------
 
-    def detect_and_draw_all(
-        self, frame: np.ndarray
-    ) -> Tuple[np.ndarray, List[Violation], List[dict]]:
+    def track_frame(self, frame: np.ndarray) -> TrackingResult:
         """
-        Chạy model, vẽ TOÀN BỘ bounding box (mọi class) lên frame.
-        Trả về (frame đã vẽ, danh sách vi phạm, danh sách box để tracking).
+        Chạy model.track(persist=True) → ByteTrack giữ ID liên tục.
+        Trả về TrackingResult: persons (với track_id), all_boxes, person_violations.
         """
-        if self._model is not None:
-            return self._detect_yolo_and_draw_all(frame)
-        violations = self._detect_demo(frame)
-        return draw_violations_on_frame(frame, violations), violations, []
+        if self._model is None:
+            return TrackingResult()
 
-    def _detect_yolo_and_draw_all(self, frame: np.ndarray) -> Tuple[np.ndarray, List[Violation], List[dict]]:
-        results = self._model.predict(
-            frame, conf=self.conf_threshold, verbose=False, stream=False, imgsz=DETECT_IMGSZ
+        results = self._model.track(
+            frame,
+            persist=True,
+            conf=self.conf_threshold,
+            imgsz=DETECT_IMGSZ,
+            verbose=False,
+            stream=False,
+            half=self._use_half,
         )
-        violations = []
-        tracked_boxes: List[dict] = []
-        out = frame.copy()
-        class_names = getattr(self._model, "names", None) or DATASET_CLASS_NAMES
-        if isinstance(class_names, dict):
-            max_id = max(class_names.keys()) if class_names else 0
-            names_list = [class_names.get(i, str(i)) for i in range(max_id + 1)]
-        else:
-            names_list = list(class_names) if class_names else []
-        colors = [
-            (255, 128, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0),
-            (255, 0, 255), (0, 255, 255), (128, 0, 255), (255, 128, 128),
-        ]
+
+        persons: List[dict] = []
+        violation_detections: List[dict] = []
+        all_boxes: List[dict] = []
+
         for r in results:
             if r.boxes is None:
                 continue
@@ -113,25 +146,145 @@ class PPEDetector:
                 cls_id = int(box.cls[0])
                 conf = float(box.conf[0])
                 x1, y1, x2, y2 = map(int, box.xyxy[0])
-                name = names_list[cls_id] if cls_id < len(names_list) else str(cls_id)
-                color = colors[cls_id % len(colors)]
-                cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
+                track_id = int(box.id[0]) if box.id is not None else -1
+                name = self._names_list[cls_id] if cls_id < len(self._names_list) else str(cls_id)
+
+                info = {
+                    "cls_id": cls_id, "conf": conf, "track_id": track_id,
+                    "bbox": (x1, y1, x2, y2), "name": name,
+                }
+                all_boxes.append(info)
+
+                if cls_id == PERSON_CLS_ID:
+                    persons.append(info)
+                elif cls_id in CLASS_INDEX_TO_VIOLATION:
+                    violation_detections.append(info)
+
+        person_violations = self._associate_violations_to_persons(
+            violation_detections, persons
+        )
+
+        return TrackingResult(
+            persons=persons,
+            all_boxes=all_boxes,
+            person_violations=person_violations,
+        )
+
+    def _associate_violations_to_persons(
+        self,
+        violation_detections: List[dict],
+        persons: List[dict],
+    ) -> Dict[int, Set[ViolationType]]:
+        """Gán mỗi violation box cho Person gần nhất (IoU / containment)."""
+        result: Dict[int, Set[ViolationType]] = {}
+        if not persons or not violation_detections:
+            return result
+
+        for vd in violation_detections:
+            vx1, vy1, vx2, vy2 = vd["bbox"]
+            vcx, vcy = (vx1 + vx2) // 2, (vy1 + vy2) // 2
+
+            best_pid = None
+            best_score = -1.0
+
+            for p in persons:
+                pid = p["track_id"]
+                if pid < 0:
+                    continue
+                px1, py1, px2, py2 = p["bbox"]
+
+                # Ưu tiên: tâm violation nằm trong person box
+                inside = px1 <= vcx <= px2 and py1 <= vcy <= py2
+
+                # Tính IoU
+                ix1, iy1 = max(vx1, px1), max(vy1, py1)
+                ix2, iy2 = min(vx2, px2), min(vy2, py2)
+                if ix1 < ix2 and iy1 < iy2:
+                    inter = (ix2 - ix1) * (iy2 - iy1)
+                else:
+                    inter = 0
+                va = max(1, (vx2 - vx1) * (vy2 - vy1))
+                pa = max(1, (px2 - px1) * (py2 - py1))
+                iou = inter / (va + pa - inter) if (va + pa - inter) > 0 else 0
+
+                score = iou + (1.0 if inside else 0.0)
+                if score > best_score:
+                    best_score = score
+                    best_pid = pid
+
+            if best_pid is not None and best_score > 0.05:
+                vtype = CLASS_INDEX_TO_VIOLATION[vd["cls_id"]]
+                result.setdefault(best_pid, set()).add(vtype)
+
+        return result
+
+    # ------------------------------------------------------------------
+    # Drawing
+    # ------------------------------------------------------------------
+
+    def draw_tracking_frame(
+        self,
+        frame: np.ndarray,
+        all_boxes: List[dict],
+        person_violations: Dict[int, Set[ViolationType]],
+    ) -> np.ndarray:
+        """Vẽ tất cả box lên frame. Person box có ID và trạng thái vi phạm."""
+        out = frame.copy()
+        for d in all_boxes:
+            x1, y1, x2, y2 = d["bbox"]
+            cls_id = d["cls_id"]
+            conf = d["conf"]
+            track_id = d.get("track_id", -1)
+            name = d.get("name", "")
+
+            if cls_id == PERSON_CLS_ID:
+                has_violation = track_id >= 0 and track_id in person_violations
+                color = PERSON_VIOLATION_COLOR if has_violation else PERSON_OK_COLOR
+                thickness = 3 if has_violation else 2
+
+                cv2.rectangle(out, (x1, y1), (x2, y2), color, thickness)
+
+                if track_id >= 0:
+                    id_label = f"ID-{track_id}"
+                    if has_violation:
+                        vtypes = person_violations[track_id]
+                        vnames = []
+                        if ViolationType.MISSING_HELMET in vtypes:
+                            vnames.append("Thieu mu")
+                        if ViolationType.MISSING_VEST in vtypes:
+                            vnames.append("Thieu ao")
+                        id_label += " " + "+".join(vnames)
+
+                    (tw, th), _ = cv2.getTextSize(id_label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+                    cv2.rectangle(out, (x1, y1 - th - 8), (x1 + tw + 6, y1), color, -1)
+                    cv2.putText(out, id_label, (x1 + 3, y1 - 5),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            elif cls_id in CLASS_INDEX_TO_VIOLATION:
+                cv2.rectangle(out, (x1, y1), (x2, y2), VIOLATION_COLOR, 2)
                 label = f"{name} {int(conf*100)}%"
                 (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+                cv2.rectangle(out, (x1, y1 - th - 6), (x1 + tw + 4, y1), VIOLATION_COLOR, -1)
+                cv2.putText(out, label, (x1 + 2, y1 - 3),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            else:
+                color = BOX_COLORS.get(cls_id, (200, 200, 200))
+                cv2.rectangle(out, (x1, y1), (x2, y2), color, 1)
+                label = f"{name} {int(conf*100)}%"
+                (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
                 cv2.rectangle(out, (x1, y1 - th - 6), (x1 + tw + 4, y1), color, -1)
-                cv2.putText(out, label, (x1 + 2, y1 - 3), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-                tracked_boxes.append({"bbox": (x1, y1, x2, y2), "name": name, "conf": conf, "cls_id": cls_id})
-                if cls_id in self.CLASS_TO_VIOLATION:
-                    violations.append(
-                        Violation(
-                            id=str(uuid.uuid4()),
-                            violation_type=self.CLASS_TO_VIOLATION[cls_id],
-                            confidence=conf,
-                            timestamp=datetime.now(),
-                            bbox=(x1, y1, x2, y2),
-                        )
-                    )
-        return out, violations, tracked_boxes
+                cv2.putText(out, label, (x1 + 2, y1 - 3),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+
+        return out
+
+    # ------------------------------------------------------------------
+    # Legacy API (giữ để backward-compat nếu cần)
+    # ------------------------------------------------------------------
+
+    def detect(self, frame: np.ndarray) -> List[Violation]:
+        if self._model is not None:
+            return self._detect_yolo(frame)
+        return []
 
     def _detect_yolo(self, frame: np.ndarray) -> List[Violation]:
         results = self._model.predict(
@@ -157,104 +310,3 @@ class PPEDetector:
                     )
                 )
         return violations
-
-    def _detect_demo(self, frame: np.ndarray) -> List[Violation]:
-        """Chế độ mẫu khi không load được model."""
-        h, w = frame.shape[:2]
-        violations = []
-        np.random.seed(hash(frame.tobytes()) % (2**32))
-        for _ in range(np.random.randint(0, 3)):
-            x1 = int(w * 0.2 + np.random.rand() * w * 0.3)
-            y1 = int(h * 0.2 + np.random.rand() * h * 0.3)
-            x2 = min(x1 + 80, w - 1)
-            y2 = min(y1 + 120, h - 1)
-            vt = ViolationType.MISSING_HELMET if np.random.rand() > 0.5 else ViolationType.MISSING_VEST
-            violations.append(
-                Violation(
-                    id=str(uuid.uuid4()),
-                    violation_type=vt,
-                    confidence=0.85 + np.random.rand() * 0.1,
-                    timestamp=datetime.now(),
-                    bbox=(x1, y1, x2, y2),
-                )
-            )
-        return violations
-
-
-def draw_tracked_boxes(
-    frame: np.ndarray,
-    tracked_boxes: List[dict],
-    violations: List[Violation],
-) -> np.ndarray:
-    """Vẽ danh sách box (từ tracker) lên frame, không gọi model."""
-    colors = [
-        (255, 128, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0),
-        (255, 0, 255), (0, 255, 255), (128, 0, 255), (255, 128, 128),
-    ]
-    out = frame.copy()
-    for d in tracked_boxes:
-        bbox = d.get("bbox")
-        if not bbox or len(bbox) != 4:
-            continue
-        x1, y1, x2, y2 = map(int, bbox)
-        name = d.get("name", "")
-        conf = d.get("conf", 0)
-        cls_id = d.get("cls_id", 0)
-        color = colors[cls_id % len(colors)]
-        cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
-        label = f"{name} {int(conf*100)}%"
-        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-        cv2.rectangle(out, (x1, y1 - th - 6), (x1 + tw + 4, y1), color, -1)
-        cv2.putText(out, label, (x1 + 2, y1 - 3), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-    return out
-
-
-def draw_violations_on_frame(
-    frame: np.ndarray,
-    violations: List[Violation],
-    font_scale: float = 0.55,
-    thickness: int = 2,
-) -> np.ndarray:
-    """Vẽ bounding box và nhãn vi phạm (tiếng Việt có dấu) lên frame BGR."""
-    if not violations:
-        return frame.copy()
-    try:
-        from PIL import Image, ImageDraw
-        from src.utils.font_utils import get_vietnamese_font
-        font_pil = get_vietnamese_font(size=14)
-    except Exception:
-        font_pil = None
-    out = frame.copy()
-    # Vẽ toàn bộ box bằng OpenCV
-    for v in violations:
-        if v.bbox is None:
-            continue
-        x1, y1, x2, y2 = v.bbox
-        color = (0, 0, 255) if v.violation_type == ViolationType.MISSING_HELMET else (0, 255, 255)
-        cv2.rectangle(out, (x1, y1), (x2, y2), color, thickness)
-    # Vẽ chữ tiếng Việt bằng PIL (một lần cho cả frame)
-    if font_pil is not None:
-        img_rgb = cv2.cvtColor(out, cv2.COLOR_BGR2RGB)
-        pil_img = Image.fromarray(img_rgb)
-        draw = ImageDraw.Draw(pil_img)
-        for v in violations:
-            if v.bbox is None:
-                continue
-            x1, y1, x2, y2 = v.bbox
-            color = (0, 0, 255) if v.violation_type == ViolationType.MISSING_HELMET else (0, 255, 255)
-            text = f"{v.label_vi} {v.confidence_pct}"
-            tx, ty = x1 + 2, max(0, y1 - 22)
-            draw.rectangle([tx - 2, ty - 2, tx + 240, ty + 18], fill=(color[2], color[1], color[0]))
-            draw.text((tx, ty), text, font=font_pil, fill=(255, 255, 255))
-        out = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
-    else:
-        for v in violations:
-            if v.bbox is None:
-                continue
-            x1, y1, x2, y2 = v.bbox
-            color = (0, 0, 255) if v.violation_type == ViolationType.MISSING_HELMET else (0, 255, 255)
-            text = f"{v.label_vi} {v.confidence_pct}"
-            (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
-            cv2.rectangle(out, (x1, y1 - th - 8), (x1 + tw + 4, y1), color, -1)
-            cv2.putText(out, text, (x1 + 2, y1 - 4), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), thickness)
-    return out

@@ -23,6 +23,7 @@ class Violation:
     timestamp: datetime
     bbox: Optional[Tuple[int, int, int, int]] = None  # x1, y1, x2, y2
     location: Optional[str] = None  # tên khu vực / camera khi ghi nhận
+    person_id: Optional[int] = None  # track ID của người vi phạm (ByteTrack)
 
     @property
     def label_vi(self) -> str:
@@ -31,6 +32,12 @@ class Violation:
         if self.violation_type == ViolationType.MISSING_VEST:
             return "Thiếu áo bảo hộ / Để lộ tay"
         return "Thiếu cả hai"
+
+    @property
+    def person_label(self) -> str:
+        if self.person_id is not None:
+            return f"Người #{self.person_id}"
+        return "Không rõ"
 
     @property
     def time_str(self) -> str:

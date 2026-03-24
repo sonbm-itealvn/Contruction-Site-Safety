@@ -26,12 +26,14 @@ CONFIDENCE_THRESHOLD = 0.25
 VIOLATION_THROTTLE_SECONDS = 0.8
 MODEL_PATH = os.path.join(PROJECT_ROOT, "helmet_best.pt")
 YOLO26_MODEL = "yolo26n.pt"
-# Chạy detection mỗi N frame (dùng chung cho cả camera và video); giữa các lần track Person hoặc vẽ lại box.
-DETECT_EVERY_N_FRAMES = 5
-# Kích thước ảnh đưa vào YOLO — dùng cho cả camera và video (nhỏ = nhanh hơn).
-DETECT_IMGSZ = 416
-# Chỉ track box "Person" giữa các lần detect. Tắt (False) để camera real-time mượt; bật (True) có thể gây lag trên máy yếu.
-TRACK_PERSON_ONLY = False
+# Chạy detection+tracking mỗi N frame; giữa các lần vẽ lại box cuối cùng.
+DETECT_EVERY_N_FRAMES = 2
+# Kích thước ảnh đưa vào YOLO (640 cho chất lượng tốt, 416 nếu máy yếu).
+DETECT_IMGSZ = 640
+# Sau bao nhiêu frame không thấy person thì xoá khỏi bộ nhớ tracking (cho phép thông báo lại nếu quay lại).
+PERSON_STALE_FRAMES = 90
+# Bật half precision (FP16) nếu có GPU CUDA → nhanh hơn ~2x.
+USE_HALF_PRECISION = True
 
 # Ghi hình
 RECORDING_ENABLED = False
@@ -41,7 +43,7 @@ RECORDINGS_DIR = os.path.join(PROJECT_ROOT, "data", "recordings")
 def load_user_settings():
     """Đọc data/settings.json (nếu có) và ghi đè lên biến cấu hình."""
     global CAMERA_INDEX, CAMERA_AREA_NAME, CONFIDENCE_THRESHOLD
-    global VIOLATION_THROTTLE_SECONDS, MODEL_PATH, TRACK_PERSON_ONLY
+    global VIOLATION_THROTTLE_SECONDS, MODEL_PATH, DETECT_IMGSZ, DETECT_EVERY_N_FRAMES
     if not os.path.isfile(USER_SETTINGS_PATH):
         return
     try:
@@ -57,8 +59,10 @@ def load_user_settings():
             VIOLATION_THROTTLE_SECONDS = float(data["violation_throttle_seconds"])
         if "model_path" in data and data["model_path"]:
             MODEL_PATH = str(data["model_path"]).strip()
-        if "track_person_only" in data:
-            TRACK_PERSON_ONLY = bool(data["track_person_only"])
+        if "detect_imgsz" in data:
+            DETECT_IMGSZ = int(data["detect_imgsz"])
+        if "detect_every_n_frames" in data:
+            DETECT_EVERY_N_FRAMES = max(1, int(data["detect_every_n_frames"]))
     except Exception:
         pass
 

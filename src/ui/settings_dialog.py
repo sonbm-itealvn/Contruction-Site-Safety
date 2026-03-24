@@ -219,7 +219,6 @@ class SettingsDialog(ctk.CTkToplevel):
             "confidence_threshold": confidence,
             "violation_throttle_seconds": throttle,
             "model_path": model_path or None,
-            "track_person_only": getattr(settings, "TRACK_PERSON_ONLY", False),
         }
         os.makedirs(settings.DATA_DIR, exist_ok=True)
         with open(settings.USER_SETTINGS_PATH, "w", encoding="utf-8") as f:

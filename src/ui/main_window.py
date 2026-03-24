@@ -21,7 +21,6 @@ from src.config.settings import (
     DATA_DIR,
     MODEL_PATH,
     PROJECT_ROOT,
-    TRACK_PERSON_ONLY,
     USER_SETTINGS_PATH,
     VIOLATION_THROTTLE_SECONDS,
     load_cameras,
@@ -104,12 +103,15 @@ class ViolationCard(ctk.CTkFrame):
         ctk.CTkLabel(inner, text=icon, font=ctk.CTkFont(_FONT_FAMILY, size=20), text_color=accent).pack(side="left", padx=(0, 10))
         right = ctk.CTkFrame(inner, fg_color="transparent")
         right.pack(side="left", fill="both", expand=True)
+        person_tag = f" [{violation.person_label}]" if getattr(violation, "person_id", None) is not None else ""
         ctk.CTkLabel(
-            right, text=violation.label_vi, font=ctk.CTkFont(_FONT_FAMILY, size=14, weight="bold"), text_color=_COLORS["text_primary"], anchor="w",
+            right, text=f"{violation.label_vi}{person_tag}",
+            font=ctk.CTkFont(_FONT_FAMILY, size=14, weight="bold"), text_color=_COLORS["text_primary"], anchor="w",
         ).pack(anchor="w")
         loc = f" - {violation.location}" if getattr(violation, "location", None) else ""
         ctk.CTkLabel(
-            right, text=f"🕐 {violation.time_str}{loc} · {violation.confidence_pct}", font=ctk.CTkFont(_FONT_FAMILY, size=12), text_color=_COLORS["text_secondary"], anchor="w",
+            right, text=f"🕐 {violation.time_str}{loc} · {violation.confidence_pct}",
+            font=ctk.CTkFont(_FONT_FAMILY, size=12), text_color=_COLORS["text_secondary"], anchor="w",
         ).pack(anchor="w")
 
 
@@ -432,8 +434,8 @@ class MainWindow:
                 sw.deselect()
             return sw
 
-        _toggle_row(s1, "🛡", "Nhận diện mũ", initial_on=True)  # luôn bật, không lưu
-        self._settings_track_switch = _toggle_row(s1, "⚡", "Theo dõi chuyển động", initial_on=TRACK_PERSON_ONLY)
+        _toggle_row(s1, "🛡", "Nhận diện mũ", initial_on=True)
+        _toggle_row(s1, "⚡", "Tracking (ByteTrack)", initial_on=True)
 
         # ---- Section 2: LƯU TRỮ & HỆ THỐNG (giống ảnh) ----
         s2 = _card("LƯU TRỮ & HỆ THỐNG")
@@ -543,15 +545,12 @@ class MainWindow:
         model_path = (self._settings_model_path.get() or "").strip()
         if model_path and not os.path.isabs(model_path):
             model_path = os.path.join(PROJECT_ROOT, model_path)
-        track_person_only = bool(self._settings_track_switch.get()) if hasattr(self, "_settings_track_switch") and self._settings_track_switch.winfo_exists() else TRACK_PERSON_ONLY
-
         data = {
             "camera_index": camera_index,
             "camera_area_name": area_name,
             "confidence_threshold": confidence,
             "violation_throttle_seconds": throttle,
             "model_path": model_path or None,
-            "track_person_only": track_person_only,
         }
         os.makedirs(DATA_DIR, exist_ok=True)
         with open(USER_SETTINGS_PATH, "w", encoding="utf-8") as f:
@@ -713,15 +712,8 @@ class MainWindow:
         self._camera_thread.start()
 
     def _on_frame(self, result: DetectionResult):
-        """Callback từ camera thread: throttle vi phạm rồi gửi lên main thread."""
-        import time
-        now = time.time()
-        to_add: List[Violation] = []
-        for v in result.violations:
-            key = v.violation_type.value
-            if now - self._last_violation_time.get(key, 0) >= VIOLATION_THROTTLE_SECONDS:
-                to_add.append(v)
-                self._last_violation_time[key] = now
+        """Callback từ camera thread: violations đã dedup theo person_id trong CameraThread."""
+        to_add = list(result.violations)
         self.root.after(0, lambda: self._on_frame_ui(result, to_add))
 
     def _on_frame_ui(self, result: DetectionResult, to_add: List[Violation]):
